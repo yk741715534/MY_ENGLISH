@@ -1,0 +1,845 @@
+MongoDB 字段加密 KMS 配置与使用详解
+
+我将详细介绍 AWS KMS、Azure Key Vault、GCP KMS​ 和 HashiCorp Vault​ 的完整配置方案。
+
+一、AWS KMS 配置（推荐）
+1. 前提准备
+bash
+复制
+# 安装 AWS CLI
+aws configure
+# 设置访问密钥
+# AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+# AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+2. 创建 AWS KMS 密钥
+bash
+复制
+# 创建对称加密密钥
+aws kms create-key --description "MongoDB FLE Master Key"
+
+# 输出类似：
+# {
+#   "KeyMetadata": {
+#     "KeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+#     "Arn": "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+#   }
+# }
+
+# 创建别名（方便管理）
+aws kms create-alias \
+  --alias-name alias/mongo-fle-key \
+  --target-key-id 1234abcd-12ab-34cd-56ef-1234567890ab
+3. 配置 IAM 权限
+json
+复制
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    }
+  ]
+}
+4. Spring Boot 完整配置
+java
+下载
+复制
+import com.mongodb.AutoEncryptionSettings;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.crypt.capi.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.beans.factory.annotation.Value;
+import org.bson.BsonDocument;
+import org.bson.BsonString;
+import org.bson.Document;
+import org.bson.UuidRepresentation;
+import org.bson.types.Binary;
+import org.bson.BsonBinary;
+import org.bson.BsonInt32;
+import org.bson.BsonArray;
+import org.bson.BsonBinarySubType;
+import org.bson.types.ObjectId;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.*;
+import java.util.Base64;
+import java.util.UUID;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.security.SecureRandom;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+
+@Configuration
+public class AwsKmsConfig {
+
+    @Value("${mongodb.uri:mongodb://localhost:27017}")
+    private String mongoUri;
+
+    @Value("${aws.kms.key.arn:}")
+    private String kmsKeyArn;
+
+    @Value("${aws.access.key:}")
+    private String awsAccessKey;
+
+    @Value("${aws.secret.key:}")
+    private String awsSecretKey;
+
+    @Value("${aws.region:us-east-1}")
+    private String awsRegion;
+
+    @Bean
+    public MongoClient mongoClient() {
+        // 1. 配置 AWS KMS 提供者
+        Map<String, Map<String, Object>> kmsProviders = new HashMap<>();
+        Map<String, Object> awsKmsConfig = new HashMap<>();
+
+        if (awsAccessKey != null && !awsAccessKey.isEmpty()) {
+            // 使用显式凭证
+            awsKmsConfig.put("accessKeyId", awsAccessKey);
+            awsKmsConfig.put("secretAccessKey", awsSecretKey);
+        } else {
+            // 从环境变量或 IAM 角色自动获取
+            awsKmsConfig.put("accessKeyId", System.getenv("AWS_ACCESS_KEY_ID"));
+            awsKmsConfig.put("secretAccessKey", System.getenv("AWS_SECRET_ACCESS_KEY"));
+        }
+
+        kmsProviders.put("aws", awsKmsConfig);
+
+        // 2. 构建加密模式（JSON Schema）
+        Map<String, BsonDocument> schemaMap = new HashMap<>();
+
+        // 示例：用户表的加密模式
+        String userSchema = """
+        {
+          "bsonType": "object",
+          "encryptMetadata": {
+            "keyId": [
+              {
+                "$binary": {
+                  "base64": "%s",
+                  "subType": "04"
+                }
+              }
+            ]
+          },
+          "properties": {
+            "pii": {
+              "bsonType": "object",
+              "properties": {
+                "ssn": {
+                  "encrypt": {
+                    "bsonType": "string",
+                    "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+                  }
+                },
+                "phone": {
+                  "encrypt": {
+                    "bsonType": "string",
+                    "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+                  }
+                },
+                "email": {
+                  "encrypt": {
+                    "bsonType": "string",
+                    "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+                  }
+                }
+              }
+            },
+            "creditCard": {
+              "encrypt": {
+                "bsonType": "string",
+                "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+              }
+            },
+            "medical": {
+              "bsonType": "object",
+              "properties": {
+                "diagnosis": {
+                  "encrypt": {
+                    "bsonType": "string",
+                    "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+                  }
+                },
+                "prescription": {
+                  "encrypt": {
+                    "bsonType": "string",
+                    "algorithm": "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+                  }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+        // 生成或获取主密钥ID
+        String keyId = getOrCreateMasterKey();
+        String formattedSchema = String.format(userSchema,
+            Base64.getEncoder().encodeToString(keyId.getBytes()));
+
+        schemaMap.put("clinic.patients", BsonDocument.parse(formattedSchema));
+
+        // 3. 创建自动加密设置
+        AutoEncryptionSettings autoEncryptionSettings = AutoEncryptionSettings.builder()
+            .keyVaultNamespace("encryption.__keyVault")
+            .kmsProviders(kmsProviders)
+            .schemaMap(schemaMap)
+            .extraOptions(Map.of(
+                "cryptSharedLibPath", "/usr/lib/mongo_crypt_v1.so"  // 加密库路径
+            ))
+            .build();
+
+        // 4. 创建 MongoClient
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString(mongoUri))
+            .autoEncryptionSettings(autoEncryptionSettings)
+            .uuidRepresentation(UuidRepresentation.STANDARD)
+            .build();
+
+        return MongoClients.create(settings);
+    }
+
+    /**
+     * 获取或创建主数据加密密钥
+     */
+    private String getOrCreateMasterKey() {
+        try (MongoClient client = MongoClients.create(mongoUri)) {
+            var keyVault = client.getDatabase("encryption")
+                .getCollection("__keyVault");
+
+            // 查找现有密钥
+            var existingKey = keyVault.find()
+                .filter(new Document("keyAltNames", "aws_master_key"))
+                .first();
+
+            if (existingKey != null) {
+                return existingKey.get("_id").toString();
+            }
+
+            // 创建新密钥
+            UUID keyUUID = UUID.randomUUID();
+            BsonDocument masterKey = new BsonDocument();
+            masterKey.append("provider", new BsonString("aws"));
+            masterKey.append("key", new BsonString(kmsKeyArn));
+            masterKey.append("region", new BsonString(awsRegion));
+
+            BsonDocument keyDocument = new BsonDocument();
+            keyDocument.append("_id", new BsonBinary(BsonBinarySubType.UUID_STANDARD,
+                uuidToBytes(keyUUID)));
+            keyDocument.append("keyMaterial", new BsonBinary(new byte[96])); // 占位
+            keyDocument.append("creationDate", new BsonInt32((int) (System.currentTimeMillis() / 1000)));
+            keyDocument.append("updateDate", new BsonInt32((int) (System.currentTimeMillis() / 1000)));
+            keyDocument.append("status", new BsonInt32(0)); // 0 = enabled
+            keyDocument.append("masterKey", masterKey);
+            keyDocument.append("keyAltNames", new BsonArray(
+                Arrays.asList(new BsonString("aws_master_key"))
+            ));
+
+            keyVault.insertOne(new Document(keyDocument));
+
+            return keyUUID.toString();
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create master key", e);
+        }
+    }
+
+    private static byte[] uuidToBytes(UUID uuid) {
+        ByteBuffer bb = ByteBuffer.wrap(new byte[16]);
+        bb.putLong(uuid.getMostSignificantBits());
+        bb.putLong(uuid.getLeastSignificantBits());
+        return bb.array();
+    }
+}
+5. application.yml 配置
+yaml
+复制
+spring:
+  data:
+    mongodb:
+      uri: mongodb+srv://cluster0.mongodb.net/myDatabase?retryWrites=true&w=majority
+      database: myDatabase
+
+encryption:
+  enabled: true
+  kms:
+    type: aws
+    # 方式1: 使用显式凭证（开发环境）
+    # access-key: ${AWS_ACCESS_KEY:}
+    # secret-key: ${AWS_SECRET_KEY:}
+
+    # 方式2: 从环境变量获取（推荐生产环境）
+    # 设置环境变量:
+    #   AWS_ACCESS_KEY_ID
+    #   AWS_SECRET_ACCESS_KEY
+    #   AWS_SESSION_TOKEN (如果使用临时凭证)
+
+    # 方式3: 使用IAM角色（EC2/EKS）
+    # 自动从实例元数据获取
+
+    key-arn: arn:aws:kms:${AWS_REGION:us-east-1}:${AWS_ACCOUNT_ID}:key/${KMS_KEY_ID}
+    region: ${AWS_REGION:us-east-1}
+
+  schema:
+    collections:
+      patients:
+        fields:
+          - name: ssn
+            type: random
+          - name: phone
+            type: deterministic
+          - name: email
+            type: deterministic
+          - name: creditCard
+            type: random
+      medical_records:
+        fields:
+          - name: diagnosis
+            type: random
+          - name: prescription
+            type: deterministic
+二、Azure Key Vault 配置
+1. 创建 Key Vault 和密钥
+bash
+复制
+# 安装 Azure CLI
+az login
+
+# 创建资源组
+az group create --name MongoDB-RG --location eastus
+
+# 创建 Key Vault
+az keyvault create \
+  --name mongo-fle-vault \
+  --resource-group MongoDB-RG \
+  --location eastus \
+  --sku premium
+
+# 创建密钥
+az keyvault key create \
+  --vault-name mongo-fle-vault \
+  --name mongodb-fle-key \
+  --protection software \
+  --ops encrypt decrypt
+2. Spring Boot 配置
+java
+下载
+复制
+@Configuration
+public class AzureKeyVaultConfig {
+
+    @Value("${azure.keyvault.uri:}")
+    private String keyVaultUri;
+
+    @Value("${azure.tenant.id:}")
+    private String tenantId;
+
+    @Value("${azure.client.id:}")
+    private String clientId;
+
+    @Value("${azure.client.secret:}")
+    private String clientSecret;
+
+    @Bean
+    public MongoClient mongoClient() {
+        // Azure KMS 配置
+        Map<String, Map<String, Object>> kmsProviders = new HashMap<>();
+        Map<String, Object> azureConfig = new HashMap<>();
+
+        azureConfig.put("tenantId", tenantId);
+        azureConfig.put("clientId", clientId);
+        azureConfig.put("clientSecret", clientSecret);
+
+        // 可选：使用托管身份
+        // azureConfig.put("useManagedIdentity", true);
+
+        kmsProviders.put("azure", azureConfig);
+
+        // 构建主密钥文档
+        BsonDocument masterKey = new BsonDocument();
+        masterKey.append("keyVaultEndpoint", new BsonString(keyVaultUri));
+        masterKey.append("keyName", new BsonString("mongodb-fle-key"));
+
+        AutoEncryptionSettings autoEncryptionSettings = AutoEncryptionSettings.builder()
+            .keyVaultNamespace("encryption.__keyVault")
+            .kmsProviders(kmsProviders)
+            .extraOptions(Map.of(
+                "cryptSharedLibPath", "/usr/lib/mongo_crypt_v1.so"
+            ))
+            .build();
+
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString(mongoUri))
+            .autoEncryptionSettings(autoEncryptionSettings)
+            .build();
+
+        return MongoClients.create(settings);
+    }
+}
+三、GCP Cloud KMS 配置
+1. 创建 GCP 密钥
+bash
+复制
+# 创建密钥环
+gcloud kms keyrings create mongo-fle-keyring \
+  --location global
+
+# 创建对称密钥
+gcloud kms keys create mongodb-fle-key \
+  --keyring mongo-fle-keyring \
+  --location global \
+  --purpose encryption \
+  --protection-level software
+2. Spring Boot 配置
+java
+下载
+复制
+@Configuration
+public class GcpKmsConfig {
+
+    @Value("${gcp.project.id:}")
+    private String projectId;
+
+    @Value("${gcp.location:global}")
+    private String location;
+
+    @Value("${gcp.keyring:mongodb-fle-keyring}")
+    private String keyRing;
+
+    @Value("${gcp.key.name:mongodb-fle-key}")
+    private String keyName;
+
+    @Bean
+    public MongoClient mongoClient() throws IOException {
+        // 从服务账号密钥文件加载凭证
+        String credentialsJson = System.getenv("GOOGLE_APPLICATION_CREDENTIALS");
+
+        Map<String, Map<String, Object>> kmsProviders = new HashMap<>();
+        Map<String, Object> gcpConfig = new HashMap<>();
+
+        if (credentialsJson != null) {
+            // 从JSON文件加载
+            gcpConfig.put("privateKey", credentialsJson);
+        } else {
+            // 从默认位置加载
+            gcpConfig.put("privateKey", "");
+        }
+
+        kmsProviders.put("gcp", gcpConfig);
+
+        // 构建主密钥文档
+        String keyPath = String.format(
+            "projects/%s/locations/%s/keyRings/%s/cryptoKeys/%s",
+            projectId, location, keyRing, keyName
+        );
+
+        BsonDocument masterKey = new BsonDocument();
+        masterKey.append("projectId", new BsonString(projectId));
+        masterKey.append("location", new BsonString(location));
+        masterKey.append("keyRing", new BsonString(keyRing));
+        masterKey.append("keyName", new BsonString(keyName));
+        masterKey.append("keyVersion", new BsonString("1"));
+
+        AutoEncryptionSettings autoEncryptionSettings = AutoEncryptionSettings.builder()
+            .keyVaultNamespace("encryption.__keyVault")
+            .kmsProviders(kmsProviders)
+            .build();
+
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString(mongoUri))
+            .autoEncryptionSettings(autoEncryptionSettings)
+            .build();
+
+        return MongoClients.create(settings);
+    }
+}
+四、HashiCorp Vault 配置
+1. 启动和配置 Vault
+bash
+复制
+# 开发模式启动
+vault server -dev
+
+# 启用 Transit 引擎
+vault secrets enable transit
+
+# 创建加密密钥
+vault write -f transit/keys/mongodb-fle-key
+2. Spring Boot 配置
+java
+下载
+复制
+@Configuration
+public class VaultConfig {
+
+    @Value("${vault.address:http://localhost:8200}")
+    private String vaultAddr;
+
+    @Value("${vault.token:}")
+    private String vaultToken;
+
+    @Value("${vault.mount.path:transit}")
+    private String mountPath;
+
+    @Value("${vault.key.name:mongodb-fle-key}")
+    private String keyName;
+
+    @Bean
+    public MongoClient mongoClient() {
+        Map<String, Map<String, Object>> kmsProviders = new HashMap<>();
+        Map<String, Object> vaultConfig = new HashMap<>();
+
+        vaultConfig.put("serverUrl", vaultAddr);
+        vaultConfig.put("token", vaultToken);
+        // 或使用 AppRole
+        // vaultConfig.put("roleId", roleId);
+        // vaultConfig.put("secretId", secretId);
+
+        kmsProviders.put("local", vaultConfig);
+
+        // 注意：Vault 通过本地代理使用
+        AutoEncryptionSettings autoEncryptionSettings = AutoEncryptionSettings.builder()
+            .keyVaultNamespace("encryption.__keyVault")
+            .kmsProviders(kmsProviders)
+            .extraOptions(Map.of(
+                "cryptSharedLibPath", "/usr/lib/mongo_crypt_v1.so"
+            ))
+            .build();
+
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString(mongoUri))
+            .autoEncryptionSettings(autoEncryptionSettings)
+            .build();
+
+        return MongoClients.create(settings);
+    }
+}
+五、统一配置工厂类
+java
+下载
+复制
+@Component
+public class KMSProviderFactory {
+
+    public enum KMSProviderType {
+        AWS, AZURE, GCP, VAULT, LOCAL
+    }
+
+    public Map<String, Map<String, Object>> createKMSProvider(
+            KMSProviderType type,
+            Map<String, String> config) {
+
+        Map<String, Map<String, Object>> kmsProviders = new HashMap<>();
+
+        switch (type) {
+            case AWS:
+                kmsProviders.put("aws", createAWSProvider(config));
+                break;
+            case AZURE:
+                kmsProviders.put("azure", createAzureProvider(config));
+                break;
+            case GCP:
+                kmsProviders.put("gcp", createGCPProvider(config));
+                break;
+            case VAULT:
+                kmsProviders.put("local", createVaultProvider(config));
+                break;
+            case LOCAL:
+                kmsProviders.put("local", createLocalProvider(config));
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported KMS provider: " + type);
+        }
+
+        return kmsProviders;
+    }
+
+    private Map<String, Object> createAWSProvider(Map<String, String> config) {
+        Map<String, Object> awsConfig = new HashMap<>();
+
+        // 优先使用环境变量
+        String accessKey = System.getenv("AWS_ACCESS_KEY_ID");
+        String secretKey = System.getenv("AWS_SECRET_ACCESS_KEY");
+        String sessionToken = System.getenv("AWS_SESSION_TOKEN");
+
+        if (accessKey != null && secretKey != null) {
+            awsConfig.put("accessKeyId", accessKey);
+            awsConfig.put("secretAccessKey", secretKey);
+            if (sessionToken != null) {
+                awsConfig.put("sessionToken", sessionToken);
+            }
+        } else {
+            // 回退到配置文件
+            awsConfig.put("accessKeyId", config.get("accessKey"));
+            awsConfig.put("secretAccessKey", config.get("secretKey"));
+        }
+
+        return awsConfig;
+    }
+
+    private Map<String, Object> createAzureProvider(Map<String, String> config) {
+        Map<String, Object> azureConfig = new HashMap<>();
+
+        azureConfig.put("tenantId", config.get("tenantId"));
+        azureConfig.put("clientId", config.get("clientId"));
+        azureConfig.put("clientSecret", config.get("clientSecret"));
+
+        // 可选：使用托管身份
+        if ("true".equals(config.get("useManagedIdentity"))) {
+            azureConfig.put("useManagedIdentity", true);
+            azureConfig.put("identityPlatformEndpoint",
+                config.getOrDefault("identityEndpoint", ""));
+        }
+
+        return azureConfig;
+    }
+
+    private Map<String, Object> createLocalProvider(Map<String, String> config) {
+        Map<String, Object> localConfig = new HashMap<>();
+
+        // 从Base64解码本地密钥
+        String base64Key = config.get("key");
+        if (base64Key != null && !base64Key.isEmpty()) {
+            byte[] keyBytes = Base64.getDecoder().decode(base64Key);
+            localConfig.put("key", keyBytes);
+        } else {
+            // 生成新的本地密钥
+            SecureRandom random = new SecureRandom();
+            byte[] key = new byte[96];
+            random.nextBytes(key);
+            localConfig.put("key", key);
+        }
+
+        return localConfig;
+    }
+}
+六、密钥轮换策略
+1. 自动密钥轮换
+java
+下载
+复制
+@Service
+public class KeyRotationService {
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    @Scheduled(cron = "0 0 0 1 * ?") // 每月1号执行
+    public void rotateMasterKey() throws Exception {
+        // 1. 创建新密钥
+        String newKeyId = createNewMasterKey();
+
+        // 2. 重新加密数据密钥
+        reencryptDataKeys(newKeyId);
+
+        // 3. 更新加密模式
+        updateEncryptionSchema(newKeyId);
+
+        // 4. 删除旧密钥（延迟）
+        scheduleOldKeyDeletion();
+    }
+
+    private String createNewMasterKey() {
+        // 在KMS中创建新版本密钥
+        // AWS: aws kms create-key
+        // 更新MongoDB密钥保管库
+        return "new-key-id";
+    }
+}
+2. 密钥版本管理
+java
+下载
+复制
+@Component
+public class KeyVersionManager {
+
+    public enum KeyStatus {
+        ACTIVE,
+        ROTATING,
+        ARCHIVED,
+        REVOKED
+    }
+
+    @Document(collection = "key_versions")
+    public class KeyVersion {
+        @Id
+        private String id;
+        private String keyId;
+        private String kmsProvider; // AWS, AZURE, GCP
+        private String kmsKeyArn;
+        private KeyStatus status;
+        private Date createdAt;
+        private Date rotatedAt;
+        private Date expiresAt;
+        private List<String> encryptedCollections;
+
+        // Getters and setters
+    }
+}
+七、生产环境最佳实践
+1. Docker 部署配置
+dockerfile
+复制
+# Dockerfile
+FROM openjdk:11-jre-slim
+
+# 安装 MongoDB 加密库
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    && wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | apt-key add - \
+    && echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" \
+       | tee /etc/apt/sources.list.d/mongodb-org-6.0.list \
+    && apt-get update \
+    && apt-get install -y mongodb-enterprise-cryptd \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制应用
+COPY target/application.jar /app.jar
+
+# 设置环境变量
+ENV MONGODB_CRYPT_SHARED_LIB_PATH=/usr/lib/mongo_crypt_v1.so
+ENV AWS_REGION=us-east-1
+
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "/app.jar"]
+2. Kubernetes 配置
+yaml
+复制
+# k8s-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-encryption-secrets
+type: Opaque
+data:
+  aws-access-key-id: ${BASE64_AWS_ACCESS_KEY}
+  aws-secret-access-key: ${BASE64_AWS_SECRET_KEY}
+  kms-key-arn: ${BASE64_KMS_KEY_ARN}
+3. 监控和审计
+java
+下载
+复制
+@Component
+public class EncryptionMonitor {
+
+    @EventListener
+    public void handleEncryptionEvent(EncryptionEvent event) {
+        // 记录加密操作
+        log.info("Encryption event: {}", event);
+
+        // 发送到监控系统
+        metrics.increment("encryption.operations");
+
+        // 审计日志
+        auditLog.log(event);
+    }
+
+    @Scheduled(fixedDelay = 60000)
+    public void checkKeyHealth() {
+        // 检查KMS连接状态
+        // 验证密钥可用性
+        // 监控加密性能
+    }
+}
+八、故障排除
+常见问题解决
+
+连接KMS失败
+
+bash
+复制
+# 检查网络连接
+nc -zv kms.us-east-1.amazonaws.com 443
+
+# 验证IAM权限
+aws kms encrypt --key-id alias/mongo-fle-key --plaintext test
+
+# 检查环境变量
+echo $AWS_ACCESS_KEY_ID
+echo $AWS_SECRET_ACCESS_KEY
+
+加密库问题
+
+bash
+复制
+# 检查加密库路径
+ls -la /usr/lib/mongo_crypt_v1.so
+
+# 设置环境变量
+export MONGODB_CRYPT_SHARED_LIB_PATH=/usr/lib/mongo_crypt_v1.so
+
+密钥访问权限
+
+java
+下载
+复制
+// 测试KMS连接
+public boolean testKMSConnection() {
+    try {
+        // 尝试加密小段数据
+        String testData = "test";
+        // ... 加密逻辑
+        return true;
+    } catch (Exception e) {
+        log.error("KMS connection failed", e);
+        return false;
+    }
+}
+九、配置检查清单
+
+✅ KMS 配置检查
+
+[ ] KMS 服务已启用
+
+[ ] 密钥已创建并有适当权限
+
+[ ] 网络访问允许（安全组/防火墙）
+
+[ ] 凭证有效且未过期
+
+✅ MongoDB 配置
+
+[ ] MongoDB 企业版 4.2+
+
+[ ] 驱动程序版本支持 FLE
+
+[ ] 加密库已安装
+
+[ ] 密钥保管库集合存在
+
+✅ 应用程序配置
+
+[ ] 正确的 KMS 提供者配置
+
+[ ] 加密模式定义完整
+
+[ ] 错误处理机制
+
+[ ] 密钥轮换策略
+
+✅ 安全合规
+
+[ ] 密钥不存储在代码中
+
+[ ] 最小权限原则
+
+[ ] 审计日志开启
+
+[ ] 定期密钥轮换
+
+需要特定云服务商的详细配置或遇到具体问题，请提供更多细节！
