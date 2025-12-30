@@ -1,0 +1,191 @@
+package com.example.s3scanner.service.transfer;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.transfer.s3.S3TransferManager;
+import software.amazon.awssdk.transfer.s3.model.*;
+import java.io.File;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class S3TransferService {
+    
+    // 使用主TransferManager
+    private final S3TransferManager s3TransferManager;
+    
+    // 也可以使用特定的TransferManager
+    @Qualifier("batchTransferManager")
+    private final S3TransferManager batchTransferManager;
+    
+    @Qualifier("highPerfTransferManager")
+    private final S3TransferManager highPerfTransferManager;
+    
+    /**
+     * 上传文件
+     */
+    public CompletableFuture<CompletedFileUpload> uploadFile(String bucket, String key, File file) {
+        PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+        
+        UploadFileRequest uploadFileRequest = UploadFileRequest.builder()
+            .putObjectRequest(putObjectRequest)
+            .source(file.toPath())
+            .overrideConfiguration(o -> o
+                .apiCallTimeout(Duration.ofMinutes(10))
+            )
+            .build();
+        
+        FileUpload fileUpload = s3TransferManager.uploadFile(uploadFileRequest);
+        
+        // 添加进度监听
+        fileUpload.completionFuture().thenAccept(completedUpload -> {
+            log.info("上传完成: {} -> s3://{}/{}, ETag: {}", 
+                file.getPath(), bucket, key, completedUpload.response().eTag());
+        });
+        
+        return fileUpload.completionFuture();
+    }
+    
+    /**
+     * 下载文件
+     */
+    public CompletableFuture<CompletedFileDownload> downloadFile(String bucket, String key, Path destination) {
+        GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+        
+        DownloadFileRequest downloadFileRequest = DownloadFileRequest.builder()
+            .getObjectRequest(getObjectRequest)
+            .destination(destination)
+            .overrideConfiguration(o -> o
+                .apiCallTimeout(Duration.ofMinutes(10))
+            )
+            .build();
+        
+        FileDownload fileDownload = s3TransferManager.downloadFile(downloadFileRequest);
+        
+        // 添加进度监听
+        AtomicLong lastProgressTime = new AtomicLong(System.currentTimeMillis());
+        
+        fileDownload.progress().subscribe(progress -> {
+            long now = System.currentTimeMillis();
+            if (now - lastProgressTime.get() > 1000) { // 每秒记录一次
+                double percent = (double) progress.bytesTransferred() / progress.totalBytes().orElse(1L) * 100;
+                log.info("下载进度: {} {}% ({}/{})", 
+                    key, String.format("%.1f", percent), 
+                    formatBytes(progress.bytesTransferred()),
+                    formatBytes(progress.totalBytes().orElse(0L)));
+                lastProgressTime.set(now);
+            }
+        });
+        
+        return fileDownload.completionFuture();
+    }
+    
+    /**
+     * 上传目录
+     */
+    public CompletableFuture<CompletedDirectoryUpload> uploadDirectory(String bucket, String prefix, Path sourceDirectory) {
+        UploadDirectoryRequest uploadDirectoryRequest = UploadDirectoryRequest.builder()
+            .bucket(bucket)
+            .prefix(prefix)
+            .source(sourceDirectory)
+            .overrideConfiguration(o -> o
+                .maxConcurrency(5)
+                .recursive(true)
+            )
+            .build();
+        
+        DirectoryUpload directoryUpload = batchTransferManager.uploadDirectory(uploadDirectoryRequest);
+        
+        // 监听进度
+        directoryUpload.progress().subscribe(progress -> {
+            log.info("目录上传进度: 已上传 {} 个文件，{} 字节", 
+                progress.transfersInitiated(), progress.bytesTransferred());
+        });
+        
+        return directoryUpload.completionFuture();
+    }
+    
+    /**
+     * 下载目录
+     */
+    public CompletableFuture<CompletedDirectoryDownload> downloadDirectory(String bucket, String prefix, Path destination) {
+        DownloadDirectoryRequest downloadDirectoryRequest = DownloadDirectoryRequest.builder()
+            .bucket(bucket)
+            .prefix(prefix)
+            .destinationDirectory(destination)
+            .overrideConfiguration(o -> o
+                .maxConcurrency(5)
+                .recursive(true)
+            )
+            .build();
+        
+        DirectoryDownload directoryDownload = batchTransferManager.downloadDirectory(downloadDirectoryRequest);
+        
+        return directoryDownload.completionFuture();
+    }
+    
+    /**
+     * 高性能批量上传
+     */
+    public CompletableFuture<Void> highPerformanceBatchUpload(String bucket, 
+                                                             String prefix, 
+                                                             Path sourceDirectory) {
+        UploadDirectoryRequest request = UploadDirectoryRequest.builder()
+            .bucket(bucket)
+            .prefix(prefix)
+            .source(sourceDirectory)
+            .build();
+        
+        DirectoryUpload upload = highPerfTransferManager.uploadDirectory(request);
+        
+        return upload.completionFuture().thenAccept(completed -> {
+            log.info("高性能批量上传完成: 成功 {} 个，失败 {} 个", 
+                completed.failedTransfers().size(), completed.failedTransfers().size());
+        });
+    }
+    
+    /**
+     * 检查上传状态
+     */
+    public TransferStatus checkUploadStatus(FileUpload fileUpload) {
+        return fileUpload.progress().snapshot().status();
+    }
+    
+    /**
+     * 取消上传
+     */
+    public void cancelUpload(FileUpload fileUpload) {
+        fileUpload.completionFuture().cancel(true);
+    }
+    
+    /**
+     * 格式化字节大小
+     */
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        } else if (bytes < 1024 * 1024) {
+            return String.format("%.1f KB", bytes / 1024.0);
+        } else if (bytes < 1024 * 1024 * 1024) {
+            return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
+        } else {
+            return String.format("%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+}

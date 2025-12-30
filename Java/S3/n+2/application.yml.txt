@@ -1,0 +1,41 @@
+# application.yml
+aws:
+  region: us-east-1
+  s3:
+    endpoint:  # 可选，用于测试
+    path-style-access-enabled: false
+
+  # HTTP客户端配置
+  http-client:
+    max-concurrency: 100
+    connection-timeout: 10s
+    read-timeout: 30s
+    write-timeout: 30s
+
+  # 传输管理器配置
+  transfer-manager:
+    # 上传配置
+    upload:
+      multipart-threshold: 8MB    # 超过此大小使用分片上传
+      multipart-part-size: 8MB    # 分片大小
+      max-concurrency: 10         # 最大并发上传数
+      directory:
+        max-concurrency: 5        # 目录上传并发数
+        recursive: true           # 是否递归上传
+        follow-symbolic-links: false
+
+    # 下载配置
+    download:
+      max-concurrency: 10         # 最大并发下载数
+      directory:
+        max-concurrency: 5        # 目录下载并发数
+        recursive: true
+
+    # 高级功能
+    enable-resume: true           # 启用断点续传
+    enable-trailing-checksum: true # 启用校验和
+
+    # 重试配置
+    retry:
+      max-attempts: 3
+      timeout: 5m
