@@ -1,0 +1,93 @@
+package com.example.s3scanner.service.scanner;
+
+import com.example.s3scanner.service.coordinator.InstanceRegistry;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedScannerService {
+    
+    private final InstanceRegistry instanceRegistry;
+    
+    /**
+     * 分布式扫描
+     */
+    public CompletableFuture<List<String>> distributedScan(String bucket, List<String> keys) {
+        // 过滤出应该由当前实例处理的key
+        List<String> keysToProcess = keys.stream()
+            .filter(key -> instanceRegistry.shouldProcess(bucket, key))
+            .collect(Collectors.toList());
+        
+        if (keysToProcess.isEmpty()) {
+            log.debug("没有需要处理的key");
+            return CompletableFuture.completedFuture(List.of());
+        }
+        
+        log.info("当前实例将处理 {}/{} 个key", keysToProcess.size(), keys.size());
+        
+        // 增加负载
+        instanceRegistry.incrementLoad();
+        
+        try {
+            // 处理key
+            return processKeys(bucket, keysToProcess)
+                .whenComplete((result, error) -> {
+                    // 减少负载
+                    instanceRegistry.decrementLoad();
+                    
+                    if (error != null) {
+                        log.error("处理失败", error);
+                    } else {
+                        log.info("处理完成: {} 个key", result.size());
+                    }
+                });
+                
+        } catch (Exception e) {
+            instanceRegistry.decrementLoad();
+            throw e;
+        }
+    }
+    
+    /**
+     * 获取实例统计
+     */
+    public Map<String, Object> getInstanceStats() {
+        return instanceRegistry.getInstanceStats();
+    }
+    
+    /**
+     * 检查负载
+     */
+    public boolean isOverloaded() {
+        return instanceRegistry.getLoadPercentage() >= 90;
+    }
+    
+    /**
+     * 获取建议的并发数
+     */
+    public int getSuggestedConcurrency() {
+        double loadPercentage = instanceRegistry.getLoadPercentage();
+        
+        if (loadPercentage >= 90) {
+            return 1;  // 高负载，降低并发
+        } else if (loadPercentage >= 70) {
+            return 2;  // 中等负载
+        } else if (loadPercentage >= 50) {
+            return 5;  // 低负载
+        } else {
+            return 10; // 空闲
+        }
+    }
+    
+    private CompletableFuture<List<String>> processKeys(String bucket, List<String> keys) {
+        // 处理逻辑实现
+        return CompletableFuture.completedFuture(keys);
+    }
+}
