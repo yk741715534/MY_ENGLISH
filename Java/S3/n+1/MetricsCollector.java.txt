@@ -1,0 +1,253 @@
+package com.example.s3scanner.service.monitor;
+
+import io.micrometer.core.instrument.*;
+import io.micrometer.core.instrument.binder.MeterBinder;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+
+/**
+ * 指标收集器
+ * 收集扫描、处理、移动等所有操作的指标
+ */
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class MetricsCollector implements MeterBinder {
+    
+    private final MeterRegistry meterRegistry;
+    
+    @Value("${app.monitor.metrics-enabled:true}")
+    private boolean metricsEnabled;
+    
+    // 计数器存储
+    private final Map<String, Counter> counters = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> customCounters = new ConcurrentHashMap<>();
+    
+    // 仪表存储
+    private final Map<String, Gauge> gauges = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> customGauges = new ConcurrentHashMap<>();
+    
+    // 计时器存储
+    private final Map<String, Timer> timers = new ConcurrentHashMap<>();
+    private final Map<String, Timer.Sample> activeTimers = new ConcurrentHashMap<>();
+    
+    // 分布摘要存储
+    private final Map<String, DistributionSummary> summaries = new ConcurrentHashMap<>();
+    
+    // 指标缓存
+    private final Map<String, Object> metricsCache = new ConcurrentHashMap<>();
+    private Instant lastCacheUpdate = Instant.now();
+    private static final Duration CACHE_TTL = Duration.ofSeconds(30);
+    
+    @PostConstruct
+    public void init() {
+        if (!metricsEnabled) {
+            log.warn("指标收集已禁用");
+            return;
+        }
+        
+        // 初始化所有指标
+        initMetrics();
+        log.info("指标收集器初始化完成");
+    }
+    
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        // 绑定所有指标
+        registerAllMetrics();
+    }
+    
+    /**
+     * 初始化指标
+     */
+    private void initMetrics() {
+        // ========== 扫描指标 ==========
+        registerCounter("s3.scan.total", "总扫描次数");
+        registerCounter("s3.scan.success", "成功扫描次数");
+        registerCounter("s3.scan.failed", "失败扫描次数");
+        registerCounter("s3.scan.cancelled", "取消扫描次数");
+        registerCounter("s3.scan.timeout", "扫描超时次数");
+        
+        registerCounter("s3.scan.objects.total", "扫描对象总数");
+        registerCounter("s3.scan.objects.new", "发现新对象数");
+        registerCounter("s3.scan.objects.skipped", "跳过对象数");
+        registerCounter("s3.scan.objects.modified", "修改对象数");
+        registerCounter("s3.scan.objects.error", "错误对象数");
+        
+        registerGauge("s3.scan.queue.size", "扫描队列大小");
+        registerGauge("s3.scan.concurrency", "并发扫描数");
+        registerGauge("s3.scan.pending", "待扫描前缀数");
+        
+        registerTimer("s3.scan.duration", "扫描耗时");
+        registerTimer("s3.scan.prefix.duration", "前缀扫描耗时");
+        registerTimer("s3.scan.page.duration", "分页扫描耗时");
+        
+        registerDistributionSummary("s3.scan.objects.per.scan", "每次扫描对象数");
+        registerDistributionSummary("s3.scan.objects.per.prefix", "每个前缀对象数");
+        
+        // ========== 处理指标 ==========
+        registerCounter("s3.process.total", "总处理次数");
+        registerCounter("s3.process.success", "成功处理次数");
+        registerCounter("s3.process.failed", "失败处理次数");
+        registerCounter("s3.process.retry", "重试处理次数");
+        registerCounter("s3.process.skipped", "跳过处理次数");
+        
+        registerGauge("s3.process.queue.size", "处理队列大小");
+        registerGauge("s3.process.concurrency", "并发处理数");
+        registerGauge("s3.process.active", "活动处理数");
+        
+        registerTimer("s3.process.duration", "处理耗时");
+        registerTimer("s3.process.download.duration", "下载耗时");
+        registerTimer("s3.process.actual.duration", "实际处理耗时");
+        registerTimer("s3.process.cleanup.duration", "清理耗时");
+        
+        registerDistributionSummary("s3.process.file.size", "处理文件大小分布");
+        registerDistributionSummary("s3.process.throughput", "处理吞吐量");
+        
+        // ========== 移动指标 ==========
+        registerCounter("s3.move.total", "总移动次数");
+        registerCounter("s3.move.success", "成功移动次数");
+        registerCounter("s3.move.failed", "失败移动次数");
+        registerCounter("s3.move.retry", "重试移动次数");
+        
+        registerCounter("s3.move.by.type.archive", "归档次数");
+        registerCounter("s3.move.by.type.backup", "备份次数");
+        registerCounter("s3.move.by.type.failed", "移动失败文件次数");
+        registerCounter("s3.move.by.type.rename", "重命名次数");
+        
+        registerGauge("s3.move.queue.size", "移动队列大小");
+        registerGauge("s3.move.pending", "待移动文件数");
+        
+        registerTimer("s3.move.duration", "移动耗时");
+        registerTimer("s3.move.copy.duration", "复制耗时");
+        registerTimer("s3.move.delete.duration", "删除耗时");
+        registerTimer("s3.move.compress.duration", "压缩耗时");
+        
+        registerDistributionSummary("s3.move.file.size", "移动文件大小分布");
+        registerDistributionSummary("s3.move.compression.ratio", "压缩比率");
+        
+        // ========== 锁指标 ==========
+        registerCounter("s3.lock.acquire.total", "锁获取总次数");
+        registerCounter("s3.lock.acquire.success", "锁获取成功次数");
+        registerCounter("s3.lock.acquire.failed", "锁获取失败次数");
+        registerCounter("s3.lock.acquire.timeout", "锁获取超时次数");
+        
+        registerCounter("s3.lock.release.total", "锁释放总次数");
+        registerCounter("s3.lock.release.success", "锁释放成功次数");
+        registerCounter("s3.lock.release.failed", "锁释放失败次数");
+        
+        registerGauge("s3.lock.active", "活跃锁数量");
+        registerGauge("s3.lock.waiting", "等待锁数量");
+        registerGauge("s3.lock.expired", "过期锁数量");
+        
+        registerTimer("s3.lock.acquire.duration", "锁获取耗时");
+        registerTimer("s3.lock.hold.duration", "锁持有时间");
+        
+        // ========== 资源指标 ==========
+        registerGauge("s3.memory.used", "内存使用量");
+        registerGauge("s3.memory.max", "最大内存");
+        registerGauge("s3.thread.count", "线程数量");
+        registerGauge("s3.thread.active", "活动线程数");
+        
+        registerTimer("s3.gc.duration", "GC耗时");
+        
+        // ========== 错误指标 ==========
+        registerCounter("s3.error.total", "总错误数");
+        registerCounter("s3.error.scan", "扫描错误数");
+        registerCounter("s3.error.process", "处理错误数");
+        registerCounter("s3.error.move", "移动错误数");
+        registerCounter("s3.error.lock", "锁错误数");
+        registerCounter("s3.error.network", "网络错误数");
+        registerCounter("s3.error.storage", "存储错误数");
+        registerCounter("s3.error.timeout", "超时错误数");
+        
+        // ========== 业务指标 ==========
+        registerCounter("s3.business.processed.total", "总处理业务数");
+        registerCounter("s3.business.processed.success", "成功处理业务数");
+        registerCounter("s3.business.processed.failed", "失败处理业务数");
+        
+        registerGauge("s3.business.queue.size", "业务队列大小");
+        registerGauge("s3.business.processing", "处理中业务数");
+        
+        registerTimer("s3.business.processing.duration", "业务处理耗时");
+        
+        // ========== 性能指标 ==========
+        registerDistributionSummary("s3.throughput.objects", "对象吞吐量");
+        registerDistributionSummary("s3.throughput.bytes", "字节吞吐量");
+        registerDistributionSummary("s3.latency", "延迟分布");
+        
+        // ========== 缓存指标 ==========
+        registerGauge("s3.cache.size", "缓存大小");
+        registerGauge("s3.cache.hit.rate", "缓存命中率");
+        registerCounter("s3.cache.hit", "缓存命中次数");
+        registerCounter("s3.cache.miss", "缓存未命中次数");
+        registerCounter("s3.cache.eviction", "缓存驱逐次数");
+    }
+    
+    /**
+     * 记录扫描
+     */
+    public void recordScan(String prefix, int newObjects, int scannedObjects, 
+                          long durationMs, boolean success) {
+        if (!metricsEnabled) return;
+        
+        try {
+            // 基本计数器
+            incrementCounter("s3.scan.total");
+            incrementCounter("s3.scan.objects.total", scannedObjects);
+            incrementCounter("s3.scan.objects.new", newObjects);
+            
+            if (success) {
+                incrementCounter("s3.scan.success");
+            } else {
+                incrementCounter("s3.scan.failed");
+            }
+            
+            // 耗时
+            recordTimer("s3.scan.duration", durationMs);
+            
+            // 标签化指标
+            Counter.builder("s3.scan.operation")
+                .description("扫描操作")
+                .tag("prefix", prefix)
+                .tag("success", String.valueOf(success))
+                .register(meterRegistry)
+                .increment();
+            
+            Counter.builder("s3.scan.objects")
+                .description("扫描对象数")
+                .tag("prefix", prefix)
+                .tag("type", "total")
+                .register(meterRegistry)
+                .increment(scannedObjects);
+            
+            Counter.builder("s3.scan.objects")
+                .description("扫描对象数")
+                .tag("prefix", prefix)
+                .tag("type", "new")
+                .register(meterRegistry)
+                .increment(newObjects);
+            
+            // 速率
+            if (durationMs > 0) {
+                double objectsPerSecond = (double) scannedObjects / (durationMs / 1000.0);
+                Gauge.builder("s3.scan.rate", objectsPerSecond, Double::doubleValue)
+                    .description("扫描速率")
+                    .tag("prefix", prefix)
+                    .register(meterRegistry);
+            }
+            
+            // 分布摘要
+            DistributionSummary.builder("s3.scan.objects.per.operation")
+                .description("每次扫描对象
