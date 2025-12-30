@@ -1,0 +1,717 @@
+MongoDB 的 WriteConcern 和 ReadConcern ，它们有什么区别，以及默认值是什么
+MongoDB WriteConcern 和 ReadConcern 详细对比
+1. 核心概念对比
+1.1 定义差异
+java
+下载
+复制
+// WriteConcern：写入关注
+// 控制写入操作的持久性保证
+WriteConcern wc = WriteConcern.MAJORITY;
+
+// ReadConcern：读取关注
+// 控制读取操作的数据一致性级别
+ReadConcern rc = ReadConcern.MAJORITY;
+1.2 作用对比表
+
+维度
+
+
+
+WriteConcern
+
+
+
+ReadConcern
+
+
+
+
+控制对象​
+
+
+
+写入操作的确认方式
+
+
+
+读取操作的数据可见性
+
+
+
+
+主要目标​
+
+
+
+数据持久性和可靠性
+
+
+
+数据一致性和隔离性
+
+
+
+
+影响范围​
+
+
+
+影响写入确认前的等待
+
+
+
+影响读取到的数据版本
+
+
+
+
+使用场景​
+
+
+
+保证数据不丢失
+
+
+
+保证读取一致性
+
+2. 默认值详解
+2.1 WriteConcern 默认值
+java
+下载
+复制
+public class DefaultWriteConcernExample {
+    public void showDefaultValues() {
+        // MongoDB 驱动程序默认 WriteConcern
+        WriteConcern defaultWriteConcern = WriteConcern.ACKNOWLEDGED;
+
+        /*
+        默认值：ACKNOWLEDGED
+        含义：
+        1. 等待主节点确认写入
+        2. 不等待复制到从节点
+        3. 不等待日志刷盘
+
+        等价于：
+        WriteConcern w = new WriteConcern(1);
+        或
+        WriteConcern w = WriteConcern.W1;
+
+        注意：这是客户端的默认值
+        如果连接字符串指定了 writeConcern，会覆盖此默认值
+        */
+    }
+}
+2.2 ReadConcern 默认值
+java
+下载
+复制
+public class DefaultReadConcernExample {
+    public void showDefaultValues() {
+        // MongoDB 驱动程序默认 ReadConcern
+        ReadConcern defaultReadConcern = ReadConcern.DEFAULT;
+
+        /*
+        默认值：ReadConcern.DEFAULT
+        实际行为：
+        1. 在复制集：等价于 LOCAL
+        2. 在分片集群：等价于 LOCAL
+        3. 不指定时使用服务器默认
+
+        LOCAL 的含义：
+        1. 读取节点本地最新数据
+        2. 可能读取到未提交或未复制的数据
+        3. 提供最终一致性
+
+        注意：DEFAULT 会根据上下文自动选择
+        */
+    }
+}
+3. 详细区别分析
+3.1 工作机制对比
+java
+下载
+复制
+@Service
+public class MechanismComparison {
+
+    public void compareMechanisms() {
+        /*
+        WriteConcern 工作流程：
+        1. 客户端发送写入请求
+        2. 主节点接收并处理
+        3. 根据 WriteConcern 等待确认
+        4. 返回结果给客户端
+
+        ReadConcern 工作流程：
+        1. 客户端发送读取请求
+        2. 节点根据 ReadConcern 决定返回哪个版本的数据
+        3. 返回数据给客户端
+        */
+
+        // WriteConcern 示例：等待确认
+        WriteConcern wcMajority = WriteConcern.MAJORITY;
+        // 工作流程：写入 -> 复制到多数节点 -> 确认 -> 返回
+
+        // ReadConcern 示例：读取已提交数据
+        ReadConcern rcMajority = ReadConcern.MAJORITY;
+        // 工作流程：读取请求 -> 检查数据版本 -> 返回已提交数据
+    }
+}
+3.2 一致性模型对比
+java
+下载
+复制
+public class ConsistencyModel {
+
+    public void compareConsistency() {
+        /*
+        WriteConcern 影响：
+        - 数据何时对写入客户端"可见"
+        - 数据持久化的程度
+        - 不影响其他客户端的读取视图
+
+        ReadConcern 影响：
+        - 客户端读取时看到的数据版本
+        - 数据的隔离级别
+        - 是否能看到未提交的数据
+        */
+
+        // 示例场景
+        WriteConcern wc = WriteConcern.MAJORITY;  // 保证数据持久化
+        ReadConcern rc = ReadConcern.MAJORITY;    // 保证读取已持久化数据
+
+        // 组合使用实现强一致性
+        // WC: 确保数据写入多数节点
+        // RC: 确保只读取已写入多数节点的数据
+    }
+}
+4. 默认值的实际行为
+4.1 WriteConcern 默认行为
+java
+下载
+复制
+@Service
+public class DefaultWriteConcernBehavior {
+
+    public void demonstrateDefaultWriteConcern() {
+        // 不指定 WriteConcern 时的行为
+        User user = new User("1", "Alice");
+
+        // 默认使用 ACKNOWLEDGED
+        mongoTemplate.save(user);
+
+        // 等价于：
+        mongoTemplate.save(user, WriteConcern.ACKNOWLEDGED);
+
+        // ACKNOWLEDGED 的行为：
+        // 1. 写入主节点
+        // 2. 主节点确认后立即返回
+        // 3. 不等待复制到从节点
+        // 4. 不等待日志刷盘
+
+        // 风险：主节点故障可能导致数据丢失
+        // 但性能最好
+    }
+
+    public void connectionStringOverride() {
+        // 连接字符串可以覆盖默认值
+        String uri1 = "mongodb://localhost:27017/test";
+        // 使用驱动程序默认：ACKNOWLEDGED
+
+        String uri2 = "mongodb://localhost:27017/test?w=majority&wtimeoutMS=5000";
+        // 覆盖为：WriteConcern.MAJORITY with 5秒超时
+
+        String uri3 = "mongodb://localhost:27017/test?journal=true&w=1";
+        // 启用日志确认
+    }
+}
+4.2 ReadConcern 默认行为
+java
+下载
+复制
+@Service
+public class DefaultReadConcernBehavior {
+
+    public void demonstrateDefaultReadConcern() {
+        // 不指定 ReadConcern 时的行为
+        User user = mongoTemplate.findById("1", User.class);
+
+        // 默认使用 DEFAULT，实际是 LOCAL
+
+        // LOCAL 的行为：
+        // 1. 读取连接节点本地的数据
+        // 2. 可能读取到未复制到其他节点的数据
+        // 3. 可能读取到未提交的事务数据
+        // 4. 提供最终一致性
+
+        // 示例：可能读取到过时数据
+        // 时间线：
+        // T1: 主节点写入数据
+        // T2: 从节点尚未复制
+        // T3: 客户端从从节点读取（LOCAL）-> 看不到新数据
+
+        // 解决方案：使用更强的 ReadConcern
+        User userConsistent = mongoTemplate.getCollection("users", User.class)
+            .withReadConcern(ReadConcern.MAJORITY)
+            .find(eq("_id", "1"))
+            .first();
+    }
+
+    public void readPreferenceInteraction() {
+        /*
+        ReadConcern 与 ReadPreference 的交互：
+
+        默认：ReadConcern.DEFAULT + ReadPreference.primary()
+
+        组合效果：
+        1. ReadConcern.LOCAL + ReadPreference.secondary()
+           - 从从节点读取
+           - 可能读取到落后数据
+
+        2. ReadConcern.MAJORITY + ReadPreference.primary()
+           - 从主节点读取
+           - 读取已提交到多数的数据
+
+        3. ReadConcern.LINEARIZABLE + ReadPreference.primary()
+           - 必须从主节点读取
+           - 最强一致性保证
+        */
+
+        // 默认组合
+        Document defaultRead = mongoTemplate.getCollection("data")
+            .find(new Document("_id", "1"))
+            .first();
+        // 等价于：
+        // ReadConcern.DEFAULT (实际 LOCAL)
+        // ReadPreference.primary()
+    }
+}
+5. 组合使用示例
+5.1 不同一致性级别的配置
+java
+下载
+复制
+@Service
+public class ConsistencyLevelConfiguration {
+
+    public enum ConsistencyLevel {
+        // 弱一致性：性能优先
+        WEAK(ReadConcern.LOCAL, WriteConcern.UNACKNOWLEDGED),
+
+        // 默认一致性：平衡
+        DEFAULT(ReadConcern.LOCAL, WriteConcern.ACKNOWLEDGED),
+
+        // 强一致性：数据安全优先
+        STRONG(ReadConcern.MAJORITY, WriteConcern.MAJORITY),
+
+        // 线性化一致性：最高级别
+        LINEARIZABLE(ReadConcern.LINEARIZABLE, WriteConcern.MAJORITY);
+
+        private final ReadConcern readConcern;
+        private final WriteConcern writeConcern;
+
+        ConsistencyLevel(ReadConcern rc, WriteConcern wc) {
+            this.readConcern = rc;
+            this.writeConcern = wc;
+        }
+
+        public MongoCollection<Document> configureCollection(
+                MongoCollection<Document> collection) {
+            return collection
+                .withReadConcern(readConcern)
+                .withWriteConcern(writeConcern);
+        }
+    }
+
+    public void demonstrateLevels() {
+        MongoCollection<Document> collection =
+            mongoTemplate.getCollection("data");
+
+        // 弱一致性配置（日志、监控数据）
+        MongoCollection<Document> weak =
+            ConsistencyLevel.WEAK.configureCollection(collection);
+
+        // 强一致性配置（订单、交易数据）
+        MongoCollection<Document> strong =
+            ConsistencyLevel.STRONG.configureCollection(collection);
+    }
+}
+5.2 读写一致性模式
+java
+下载
+复制
+@Service
+public class ReadWritePatterns {
+
+    /**
+     * 模式1：最终一致性
+     * 写入：快速确认
+     * 读取：可能读到旧数据
+     */
+    public void eventualConsistency() {
+        WriteConcern wc = WriteConcern.ACKNOWLEDGED;  // 或 UNACKNOWLEDGED
+        ReadConcern rc = ReadConcern.LOCAL;          // 或 AVAILABLE
+
+        // 适用：用户会话、缓存数据、行为日志
+    }
+
+    /**
+     * 模式2：会话一致性
+     * 写入：确认写入
+     * 读取：总能读到自己的写入
+     */
+    public void sessionConsistency() {
+        WriteConcern wc = WriteConcern.W1;           // 主节点确认
+        ReadConcern rc = ReadConcern.LOCAL;
+        // 从主节点读取确保读到自己的写入
+        ReadPreference rp = ReadPreference.primary();
+
+        // 适用：用户资料、购物车
+    }
+
+    /**
+     * 模式3：强一致性
+     * 写入：多数派确认
+     * 读取：读取多数派确认的数据
+     */
+    public void strongConsistency() {
+        WriteConcern wc = WriteConcern.MAJORITY
+            .withWTimeout(5, TimeUnit.SECONDS);
+        ReadConcern rc = ReadConcern.MAJORITY;
+
+        // 适用：金融交易、库存管理
+    }
+
+    /**
+     * 模式4：线性化一致性
+     * 写入：多数派确认
+     * 读取：线性化读取
+     */
+    public void linearizableConsistency() {
+        WriteConcern wc = WriteConcern.MAJORITY
+            .withJournal(true);
+        ReadConcern rc = ReadConcern.LINEARIZABLE;
+        ReadPreference rp = ReadPreference.primary();
+
+        // 适用：分布式锁、选举
+    }
+}
+6. 默认值的影响和最佳实践
+6.1 默认值的风险
+java
+下载
+复制
+@Service
+public class DefaultValueRisks {
+
+    public void demonstrateRisks() {
+        // 风险1：数据丢失（使用默认 WriteConcern.ACKNOWLEDGED）
+        // 主节点写入后立即崩溃，数据未复制到从节点 -> 数据丢失
+
+        // 风险2：脏读（使用默认 ReadConcern.LOCAL）
+        // 读取从节点时，可能读到未提交的事务数据
+
+        // 风险3：不一致读取
+        // 时间线：
+        // 1. 客户端A写入数据（主节点）
+        // 2. 客户端B立即从从节点读取
+        // 3. 从节点尚未复制 -> 客户端B看不到A的写入
+
+        // 解决方案：
+        // 1. 重要数据使用更强的 WriteConcern
+        // 2. 需要一致性的读取使用 ReadConcern.MAJORITY
+        // 3. 或从主节点读取
+    }
+
+    public void safeDefaultsForProduction() {
+        // 生产环境推荐配置
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString("mongodb://localhost:27017"))
+            .writeConcern(WriteConcern.MAJORITY.withWTimeout(5, TimeUnit.SECONDS))
+            .readConcern(ReadConcern.MAJORITY)
+            .readPreference(ReadPreference.primaryPreferred())
+            .retryWrites(true)
+            .retryReads(true)
+            .build();
+    }
+}
+6.2 根据业务选择配置
+java
+下载
+复制
+@Component
+public class BusinessSpecificConfiguration {
+
+    public MongoCollection<Document> getCollectionForBusiness(
+            String collectionName, BusinessType type) {
+
+        MongoCollection<Document> collection =
+            mongoTemplate.getCollection(collectionName);
+
+        switch (type) {
+            case AUDIT_LOG:
+                // 审计日志：不能丢失，但读取不频繁
+                return collection
+                    .withWriteConcern(WriteConcern.JOURNALED)
+                    .withReadConcern(ReadConcern.LOCAL);
+
+            case FINANCIAL_TRANSACTION:
+                // 金融交易：最强一致性
+                return collection
+                    .withWriteConcern(WriteConcern.MAJORITY.withJournal(true))
+                    .withReadConcern(ReadConcern.LINEARIZABLE)
+                    .withReadPreference(ReadPreference.primary());
+
+            case USER_SESSION:
+                // 用户会话：性能优先，允许少量数据丢失
+                return collection
+                    .withWriteConcern(WriteConcern.UNACKNOWLEDGED)
+                    .withReadConcern(ReadConcern.LOCAL);
+
+            case PRODUCT_CATALOG:
+                // 商品目录：最终一致性可接受
+                return collection
+                    .withWriteConcern(WriteConcern.W1)
+                    .withReadConcern(ReadConcern.LOCAL)
+                    .withReadPreference(ReadPreference.secondaryPreferred());
+
+            case SHOPPING_CART:
+                // 购物车：需要会话一致性
+                return collection
+                    .withWriteConcern(WriteConcern.W1)
+                    .withReadConcern(ReadConcern.LOCAL)
+                    .withReadPreference(ReadPreference.primary());
+
+            default:
+                return collection;  // 使用默认配置
+        }
+    }
+
+    public enum BusinessType {
+        AUDIT_LOG,
+        FINANCIAL_TRANSACTION,
+        USER_SESSION,
+        PRODUCT_CATALOG,
+        SHOPPING_CART
+    }
+}
+7. 监控和调优
+7.1 监控读写配置
+java
+下载
+复制
+@Service
+@Slf4j
+public class ReadWriteConcernMonitor {
+
+    public void monitorCurrentSettings() {
+        // 获取当前集合的配置
+        MongoCollection<Document> collection =
+            mongoTemplate.getCollection("users");
+
+        WriteConcern currentWriteConcern = collection.getWriteConcern();
+        ReadConcern currentReadConcern = collection.getReadConcern();
+
+        log.info("当前 WriteConcern: {}", currentWriteConcern);
+        log.info("当前 ReadConcern: {}", currentReadConcern);
+
+        // 检查服务器状态
+        Document serverStatus = mongoTemplate.getDb().runCommand(
+            new Document("serverStatus", 1)
+        );
+
+        // 检查复制集状态
+        Document replStatus = mongoTemplate.getDb().runCommand(
+            new Document("replSetGetStatus", 1)
+        );
+
+        // 根据状态调整配置
+        adjustConcernsBasedOnStatus(replStatus);
+    }
+
+    private void adjustConcernsBasedOnStatus(Document replStatus) {
+        String myState = replStatus.get("myState", String.class);
+        List<Document> members = replStatus.get("members", List.class);
+
+        int healthyMembers = 0;
+        for (Document member : members) {
+            int state = member.getInteger("state");
+            if (state == 1 || state == 2) {  // PRIMARY or SECONDARY
+                healthyMembers++;
+            }
+        }
+
+        // 如果健康节点少于3个，降低 WriteConcern
+        if (healthyMembers < 3) {
+            log.warn("健康节点少于3个，考虑降低 WriteConcern 要求");
+            // 可以从 MAJORITY 降级为 W1
+        }
+    }
+}
+8. 总结对比表
+
+特性
+
+
+
+WriteConcern
+
+
+
+ReadConcern
+
+
+
+
+默认值​
+
+
+
+ACKNOWLEDGED(W1)
+
+
+
+DEFAULT(实际是 LOCAL)
+
+
+
+
+主要作用​
+
+
+
+控制写入持久性
+
+
+
+控制读取一致性
+
+
+
+
+确认目标​
+
+
+
+写入到多少个节点
+
+
+
+读取哪个版本的数据
+
+
+
+
+性能影响​
+
+
+
+写入延迟增加
+
+
+
+读取延迟可能增加
+
+
+
+
+数据安全​
+
+
+
+防止数据丢失
+
+
+
+防止脏读、不可重复读
+
+
+
+
+常用级别​
+
+
+
+UNACKNOWLEDGED, ACKNOWLEDGED, MAJORITY, JOURNALED
+
+
+
+LOCAL, AVAILABLE, MAJORITY, LINEARIZABLE
+
+
+
+
+使用场景​
+
+
+
+日志、普通数据、关键数据
+
+
+
+普通查询、强一致查询、事务
+
+9. 重要建议
+
+不要盲目使用强一致性：根据业务需求选择合适级别
+
+默认值可能不适用于生产：评估数据重要性
+
+监控和调整：根据集群状态动态调整
+
+组合使用：WriteConcern和 ReadConcern配合实现一致性目标
+
+超时设置：总是设置合理的超时时间
+
+错误处理：准备好处理因一致性要求导致的错误
+
+9.1 实际配置示例
+java
+下载
+复制
+@Configuration
+public class PracticalMongoConfig {
+
+    @Bean
+    public MongoClient mongoClient() {
+        // 生产环境推荐配置
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(new ConnectionString(getMongoUri()))
+            // 写入：多数派确认，5秒超时
+            .writeConcern(WriteConcern.MAJORITY
+                .withWTimeout(5, TimeUnit.SECONDS)
+                .withJournal(false))
+            // 读取：多数派确认的数据
+            .readConcern(ReadConcern.MAJORITY)
+            // 优先主节点，主节点不可用时用从节点
+            .readPreference(ReadPreference.primaryPreferred())
+            // 自动重试
+            .retryWrites(true)
+            .retryReads(true)
+            .build();
+
+        return MongoClient.create(settings);
+    }
+
+    private String getMongoUri() {
+        // 在连接字符串中也可以指定
+        return "mongodb://user:pass@host1:27017,host2:27017,host3:27017/db" +
+               "?replicaSet=myReplicaSet" +
+               "&readPreference=primaryPreferred" +
+               "&maxStalenessSeconds=120" +
+               "&connectTimeoutMS=3000" +
+               "&socketTimeoutMS=10000";
+    }
+}
+
+核心要点：
+
+WriteConcern控制数据写入的安全性
+
+ReadConcern控制数据读取的一致性
+
+默认配置适合开发环境，生产环境需要根据业务调整
+
+两者配合使用才能实现完整的一致性保证
