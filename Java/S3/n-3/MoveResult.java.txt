@@ -1,0 +1,490 @@
+package com.example.s3scanner.service.mover.dto;
+
+import lombok.*;
+import software.amazon.awssdk.services.s3.model.StorageClass;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.time.Instant;
+
+/**
+ * 文件移动结果DTO
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode
+public class MoveResult {
+    
+    // ========== 基本结果 ==========
+    
+    /**
+     * 是否成功
+     */
+    private boolean success;
+    
+    /**
+     * 源Bucket
+     */
+    private String sourceBucket;
+    
+    /**
+     * 源文件Key
+     */
+    private String sourceKey;
+    
+    /**
+     * 目标Bucket
+     */
+    private String targetBucket;
+    
+    /**
+     * 目标文件Key
+     */
+    private String targetKey;
+    
+    /**
+     * 移动类型
+     */
+    private MoveRequest.MoveType moveType;
+    
+    // ========== 文件信息 ==========
+    
+    /**
+     * 文件大小（字节）
+     */
+    private Long fileSize;
+    
+    /**
+     * 原始文件大小（压缩前）
+     */
+    private Long originalFileSize;
+    
+    /**
+     * 压缩后文件大小
+     */
+    private Long compressedFileSize;
+    
+    /**
+     * 压缩比率
+     */
+    private Double compressionRatio;
+    
+    /**
+     * 存储类型
+     */
+    private StorageClass storageClass;
+    
+    /**
+     * 文件ETag
+     */
+    private String etag;
+    
+    /**
+     * 文件MD5
+     */
+    private String md5;
+    
+    /**
+     * 内容类型
+     */
+    private String contentType;
+    
+    // ========== 处理信息 ==========
+    
+    /**
+     * 是否压缩
+     */
+    @Builder.Default
+    private boolean compressed = false;
+    
+    /**
+     * 压缩格式
+     */
+    private MoveRequest.CompressionFormat compressionFormat;
+    
+    /**
+     * 移动后源文件是否存在
+     */
+    @Builder.Default
+    private boolean sourceDeleted = false;
+    
+    /**
+     * 目标文件是否已验证
+     */
+    @Builder.Default
+    private boolean targetVerified = false;
+    
+    // ========== 时间信息 ==========
+    
+    /**
+     * 移动开始时间
+     */
+    private LocalDateTime startTime;
+    
+    /**
+     * 移动结束时间
+     */
+    private LocalDateTime endTime;
+    
+    /**
+     * 移动耗时（毫秒）
+     */
+    private Long durationMs;
+    
+    /**
+     * 移动速率（字节/秒）
+     */
+    private Double moveRate;
+    
+    // ========== 审计信息 ==========
+    
+    /**
+     * 请求ID
+     */
+    private String requestId;
+    
+    /**
+     * 操作ID
+     */
+    private String operationId;
+    
+    /**
+     * 操作用户
+     */
+    private String operator;
+    
+    /**
+     * 实例ID
+     */
+    private String instanceId;
+    
+    // ========== 错误信息 ==========
+    
+    /**
+     * 错误消息
+     */
+    private String errorMessage;
+    
+    /**
+     * 错误代码
+     */
+    private String errorCode;
+    
+    /**
+     * 异常类
+     */
+    private String exceptionClass;
+    
+    /**
+     * 错误堆栈
+     */
+    private String errorStackTrace;
+    
+    /**
+     * 重试次数
+     */
+    @Builder.Default
+    private int retryCount = 0;
+    
+    // ========== 扩展信息 ==========
+    
+    /**
+     * 扩展属性
+     */
+    @Builder.Default
+    private Map<String, Object> extendedProperties = new HashMap<>();
+    
+    /**
+     * 警告信息
+     */
+    @Builder.Default
+    private List<String> warnings = new ArrayList<>();
+    
+    /**
+     * 元数据
+     */
+    @Builder.Default
+    private Map<String, String> metadata = new HashMap<>();
+    
+    /**
+     * 处理结果
+     */
+    private Object processingResult;
+    
+    // ========== 静态工厂方法 ==========
+    
+    /**
+     * 创建成功结果
+     */
+    public static MoveResult success(MoveRequest request, 
+                                    String targetKey, 
+                                    long fileSize) {
+        LocalDateTime endTime = LocalDateTime.now();
+        long durationMs = Duration.between(request.getOperationTime(), endTime).toMillis();
+        
+        return MoveResult.builder()
+            .success(true)
+            .sourceBucket(request.getBucket())
+            .sourceKey(request.getSourceKey())
+            .targetBucket(request.getEffectiveTargetBucket())
+            .targetKey(targetKey)
+            .moveType(request.getMoveType())
+            .fileSize(fileSize)
+            .startTime(request.getOperationTime())
+            .endTime(endTime)
+            .durationMs(durationMs)
+            .moveRate(calculateMoveRate(fileSize, durationMs))
+            .requestId(request.getRequestId())
+            .operator(request.getOperator())
+            .sourceDeleted(!request.isKeepSource())
+            .targetVerified(request.isVerifyMove())
+            .build();
+    }
+    
+    /**
+     * 创建压缩成功结果
+     */
+    public static MoveResult compressionSuccess(MoveRequest request,
+                                               String targetKey,
+                                               long originalSize,
+                                               long compressedSize) {
+        MoveResult result = success(request, targetKey, compressedSize);
+        result.setCompressed(true);
+        result.setOriginalFileSize(originalSize);
+        result.setCompressedFileSize(compressedSize);
+        result.setCompressionRatio(calculateCompressionRatio(originalSize, compressedSize));
+        result.setCompressionFormat(request.getCompressionFormat());
+        return result;
+    }
+    
+    /**
+     * 创建失败结果
+     */
+    public static MoveResult failure(MoveRequest request, Exception e) {
+        return MoveResult.builder()
+            .success(false)
+            .sourceBucket(request.getBucket())
+            .sourceKey(request.getSourceKey())
+            .targetBucket(request.getEffectiveTargetBucket())
+            .moveType(request.getMoveType())
+            .startTime(request.getOperationTime())
+            .endTime(LocalDateTime.now())
+            .durationMs(Duration.between(request.getOperationTime(), LocalDateTime.now()).toMillis())
+            .errorMessage(e.getMessage())
+            .errorCode(getErrorCode(e))
+            .exceptionClass(e.getClass().getName())
+            .errorStackTrace(getStackTrace(e))
+            .retryCount(request.getEffectiveRetryConfig().getMaxAttempts())
+            .requestId(request.getRequestId())
+            .operator(request.getOperator())
+            .build();
+    }
+    
+    /**
+     * 创建失败结果（带重试信息）
+     */
+    public static MoveResult failureWithRetry(MoveRequest request, Exception e, int retryCount) {
+        MoveResult result = failure(request, e);
+        result.setRetryCount(retryCount);
+        return result;
+    }
+    
+    /**
+     * 创建跳过结果
+     */
+    public static MoveResult skipped(String sourceKey, String reason) {
+        return MoveResult.builder()
+            .success(true)
+            .sourceKey(sourceKey)
+            .errorMessage("SKIPPED: " + reason)
+            .startTime(LocalDateTime.now())
+            .endTime(LocalDateTime.now())
+            .durationMs(0L)
+            .build();
+    }
+    
+    // ========== 工具方法 ==========
+    
+    /**
+     * 获取移动的完整路径
+     */
+    public String getSourcePath() {
+        return String.format("s3://%s/%s", sourceBucket, sourceKey);
+    }
+    
+    public String getTargetPath() {
+        if (targetBucket == null || targetKey == null) {
+            return null;
+        }
+        return String.format("s3://%s/%s", targetBucket, targetKey);
+    }
+    
+    /**
+     * 获取压缩节省的空间
+     */
+    public Long getSpaceSaved() {
+        if (originalFileSize != null && compressedFileSize != null) {
+            return originalFileSize - compressedFileSize;
+        }
+        return null;
+    }
+    
+    /**
+     * 获取压缩率（百分比）
+     */
+    public Double getCompressionPercentage() {
+        if (compressionRatio != null) {
+            return (1 - compressionRatio) * 100;
+        }
+        return null;
+    }
+    
+    /**
+     * 是否跨Bucket移动
+     */
+    public boolean isCrossBucketMove() {
+        return targetBucket != null && !targetBucket.equals(sourceBucket);
+    }
+    
+    /**
+     * 添加扩展属性
+     */
+    public void addExtendedProperty(String key, Object value) {
+        if (extendedProperties == null) {
+            extendedProperties = new HashMap<>();
+        }
+        extendedProperties.put(key, value);
+    }
+    
+    /**
+     * 添加警告
+     */
+    public void addWarning(String warning) {
+        if (warnings == null) {
+            warnings = new ArrayList<>();
+        }
+        warnings.add(warning);
+    }
+    
+    /**
+     * 添加元数据
+     */
+    public void addMetadata(String key, String value) {
+        if (metadata == null) {
+            metadata = new HashMap<>();
+        }
+        metadata.put(key, value);
+    }
+    
+    /**
+     * 获取格式化后的耗时
+     */
+    public String getFormattedDuration() {
+        if (durationMs == null) {
+            return "N/A";
+        }
+        
+        if (durationMs < 1000) {
+            return String.format("%dms", durationMs);
+        } else {
+            double seconds = durationMs / 1000.0;
+            return String.format("%.2fs", seconds);
+        }
+    }
+    
+    /**
+     * 获取格式化后的文件大小
+     */
+    public String getFormattedFileSize() {
+        if (fileSize == null) {
+            return "N/A";
+        }
+        
+        if (fileSize < 1024) {
+            return String.format("%d B", fileSize);
+        } else if (fileSize < 1024 * 1024) {
+            return String.format("%.2f KB", fileSize / 1024.0);
+        } else if (fileSize < 1024 * 1024 * 1024) {
+            return String.format("%.2f MB", fileSize / (1024.0 * 1024.0));
+        } else {
+            return String.format("%.2f GB", fileSize / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+    
+    /**
+     * 获取移动状态描述
+     */
+    public String getStatusDescription() {
+        if (success) {
+            if (compressed) {
+                return String.format("成功压缩并移动到: %s (压缩率: %.1f%%)", 
+                    getTargetPath(), getCompressionPercentage());
+            } else {
+                return String.format("成功移动到: %s", getTargetPath());
+            }
+        } else {
+            return String.format("移动失败: %s", errorMessage);
+        }
+    }
+    
+    // ========== 私有工具方法 ==========
+    
+    private static double calculateMoveRate(long fileSize, long durationMs) {
+        if (durationMs <= 0) {
+            return 0;
+        }
+        return fileSize * 1000.0 / durationMs;  // 字节/秒
+    }
+    
+    private static double calculateCompressionRatio(long originalSize, long compressedSize) {
+        if (originalSize <= 0) {
+            return 0;
+        }
+        return (double) compressedSize / originalSize;
+    }
+    
+    private static String getErrorCode(Exception e) {
+        // 可以根据异常类型返回具体的错误代码
+        if (e instanceof software.amazon.awssdk.services.s3.model.S3Exception) {
+            return ((software.amazon.awssdk.services.s3.model.S3Exception) e)
+                .awsErrorDetails().errorCode();
+        }
+        return "UNKNOWN";
+    }
+    
+    private static String getStackTrace(Exception e) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(e.getClass().getName()).append(": ").append(e.getMessage()).append("\n");
+        for (StackTraceElement element : e.getStackTrace()) {
+            sb.append("\tat ").append(element.toString()).append("\n");
+        }
+        return sb.toString();
+    }
+    
+    // ========== Builder 扩展 ==========
+    
+    public static class MoveResultBuilder {
+        public MoveResultBuilder durationFromStart() {
+            if (startTime != null && endTime != null) {
+                this.durationMs = Duration.between(startTime, endTime).toMillis();
+            }
+            return this;
+        }
+        
+        public MoveResultBuilder calculateMoveRate() {
+            if (fileSize != null && durationMs != null && durationMs > 0) {
+                this.moveRate = fileSize * 1000.0 / durationMs;
+            }
+            return this;
+        }
+        
+        public MoveResultBuilder calculateCompressionRatio() {
+            if (originalFileSize != null && originalFileSize > 0 && compressedFileSize != null) {
+                this.compressionRatio = (double) compressedFileSize / originalFileSize;
+            }
+            return this;
+        }
+    }
+}

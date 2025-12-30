@@ -1,0 +1,183 @@
+package com.example.s3scanner.service.mover.dto;
+
+import lombok.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * 批量移动结果
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class BatchMoveResult {
+    
+    /**
+     * 请求ID
+     */
+    private String batchRequestId;
+    
+    /**
+     * 批量操作开始时间
+     */
+    private Date batchStartTime;
+    
+    /**
+     * 批量操作结束时间
+     */
+    private Date batchEndTime;
+    
+    /**
+     * 批量操作总耗时（毫秒）
+     */
+    private Long batchDurationMs;
+    
+    /**
+     * 成功的结果列表
+     */
+    @Builder.Default
+    private List<MoveResult> successes = new ArrayList<>();
+    
+    /**
+     * 失败的结果列表
+     */
+    @Builder.Default
+    private List<MoveResult> failures = new ArrayList<>();
+    
+    /**
+     * 跳过的结果列表
+     */
+    @Builder.Default
+    private List<MoveResult> skips = new ArrayList<>();
+    
+    /**
+     * 统计信息
+     */
+    private Statistics statistics;
+    
+    /**
+     * 添加成功结果
+     */
+    public void addSuccess(MoveResult result) {
+        successes.add(result);
+    }
+    
+    /**
+     * 添加失败结果
+     */
+    public void addFailure(MoveResult result) {
+        failures.add(result);
+    }
+    
+    /**
+     * 添加跳过结果
+     */
+    public void addSkip(MoveResult result) {
+        skips.add(result);
+    }
+    
+    /**
+     * 计算统计信息
+     */
+    public Statistics calculateStatistics() {
+        AtomicInteger totalBytes = new AtomicInteger(0);
+        AtomicInteger compressedBytes = new AtomicInteger(0);
+        
+        successes.forEach(result -> {
+            if (result.getFileSize() != null) {
+                totalBytes.addAndGet(result.getFileSize().intValue());
+            }
+            if (result.getCompressedFileSize() != null) {
+                compressedBytes.addAndGet(result.getCompressedFileSize().intValue());
+            }
+        });
+        
+        statistics = Statistics.builder()
+            .totalFiles(successes.size() + failures.size() + skips.size())
+            .successfulFiles(successes.size())
+            .failedFiles(failures.size())
+            .skippedFiles(skips.size())
+            .successRate(calculateSuccessRate())
+            .totalBytesMoved(totalBytes.get())
+            .totalBytesSaved(calculateBytesSaved())
+            .averageDurationMs(calculateAverageDuration())
+            .build();
+        
+        return statistics;
+    }
+    
+    /**
+     * 计算成功率
+     */
+    public double calculateSuccessRate() {
+        int total = successes.size() + failures.size() + skips.size();
+        if (total == 0) {
+            return 0;
+        }
+        return (double) successes.size() / total * 100;
+    }
+    
+    /**
+     * 计算节省的字节数
+     */
+    public long calculateBytesSaved() {
+        return successes.stream()
+            .filter(MoveResult::isCompressed)
+            .mapToLong(result -> {
+                if (result.getOriginalFileSize() != null && result.getCompressedFileSize() != null) {
+                    return result.getOriginalFileSize() - result.getCompressedFileSize();
+                }
+                return 0;
+            })
+            .sum();
+    }
+    
+    /**
+     * 计算平均耗时
+     */
+    public double calculateAverageDuration() {
+        if (successes.isEmpty()) {
+            return 0;
+        }
+        
+        return successes.stream()
+            .filter(result -> result.getDurationMs() != null)
+            .mapToLong(MoveResult::getDurationMs)
+            .average()
+            .orElse(0);
+    }
+    
+    /**
+     * 获取摘要信息
+     */
+    public String getSummary() {
+        calculateStatistics();
+        
+        return String.format(
+            "批量移动完成: 总共 %d 个文件, 成功 %d 个, 失败 %d 个, 跳过 %d 个, 成功率: %.1f%%, 耗时: %dms",
+            statistics.getTotalFiles(),
+            statistics.getSuccessfulFiles(),
+            statistics.getFailedFiles(),
+            statistics.getSkippedFiles(),
+            statistics.getSuccessRate(),
+            batchDurationMs
+        );
+    }
+    
+    /**
+     * 统计信息
+     */
+    @Data
+    @Builder
+    public static class Statistics {
+        private int totalFiles;
+        private int successfulFiles;
+        private int failedFiles;
+        private int skippedFiles;
+        private double successRate;
+        private long totalBytesMoved;
+        private long totalBytesSaved;
+        private double averageDurationMs;
+    }
+}

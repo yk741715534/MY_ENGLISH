@@ -1,0 +1,32 @@
+// BatchFileMover.java
+@Component
+public class BatchFileMover {
+    
+    /**
+     * 使用S3批量复制API
+     */
+    public void batchCopyFiles(String bucket, List<CopyEntry> entries) {
+        List<CopyObjectRequest> requests = entries.stream()
+            .map(entry -> CopyObjectRequest.builder()
+                .sourceBucket(bucket)
+                .sourceKey(entry.getSourceKey())
+                .destinationBucket(bucket)
+                .destinationKey(entry.getTargetKey())
+                .build())
+            .collect(Collectors.toList());
+        
+        // 批量提交
+        List<CompletableFuture<CopyObjectResponse>> futures = requests.stream()
+            .map(request -> s3Client.copyObject(request))
+            .collect(Collectors.toList());
+        
+        // 等待所有完成
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .orTimeout(30, TimeUnit.SECONDS)
+            .whenComplete((result, throwable) -> {
+                if (throwable != null) {
+                    log.error("批量复制失败", throwable);
+                }
+            });
+    }
+}

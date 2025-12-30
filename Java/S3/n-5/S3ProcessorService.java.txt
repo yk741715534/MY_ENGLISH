@@ -1,0 +1,485 @@
+package com.example.s3scanner.service.processor;
+
+import com.example.s3scanner.model.domain.ProcessedFile;
+import com.example.s3scanner.model.domain.S3ObjectInfo;
+import com.example.s3scanner.repository.ProcessedFileRepository;
+import com.example.s3scanner.repository.S3ObjectInfoRepository;
+import com.example.s3scanner.service.coordinator.DistributedCoordinator;
+import com.example.s3scanner.service.mover.S3FileMover;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import software.amazon.awssdk.core.async.AsyncResponseTransformer;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.core.ResponseBytes;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class S3ProcessorService {
+    
+    private final S3AsyncClient s3Client;
+    private final S3ObjectInfoRepository objectRepository;
+    private final ProcessedFileRepository processedRepository;
+    private final DistributedCoordinator coordinator;
+    private final S3FileMover fileMover;
+    private final FileProcessor fileProcessor;
+    
+    @Value("${app.processor.download-dir}")
+    private String downloadDir;
+    
+    @Value("${app.processor.download-timeout-ms}")
+    private long downloadTimeout;
+    
+    @Value("${app.processor.process-timeout-ms}")
+    private long processTimeout;
+    
+    @Value("${app.processor.max-retries}")
+    private int maxRetries;
+    
+    /**
+     * 处理单个S3对象
+     */
+    @Transactional
+    public ProcessingResult processObject(String bucket, String key) {
+        String objectId = bucket + ":" + key;
+        long startTime = System.currentTimeMillis();
+        
+        log.info("开始处理对象: {}/{}", bucket, key);
+        
+        // 1. 获取处理锁
+        if (!coordinator.acquireProcessLock(bucket, key, 30000)) {
+            return ProcessingResult.locked("无法获取处理锁");
+        }
+        
+        try {
+            // 2. 检查是否已处理
+            Optional<ProcessedFile> existingProcessed = processedRepository
+                .findByBucketAndKeyAndStatus(bucket, key, 
+                    ProcessedFile.ProcessingStatus.COMPLETED);
+            
+            if (existingProcessed.isPresent()) {
+                ProcessedFile processed = existingProcessed.get();
+                
+                // 检查文件是否被修改
+                Optional<S3ObjectInfo> objectInfo = objectRepository.findByBucketAndKey(bucket, key);
+                if (objectInfo.isPresent() && 
+                    objectInfo.get().getEtag() != null &&
+                    objectInfo.get().getEtag().equals(processed.getEtag())) {
+                    
+                    log.debug("对象已处理且未修改: {}", key);
+                    return ProcessingResult.skipped("Already processed");
+                }
+            }
+            
+            // 3. 更新对象状态
+            S3ObjectInfo objectInfo = objectRepository.findByBucketAndKey(bucket, key)
+                .orElseGet(() -> S3ObjectInfo.builder()
+                    .id(objectId)
+                    .bucket(bucket)
+                    .key(key)
+                    .status(S3ObjectInfo.ProcessingStatus.PROCESSING)
+                    .createdAt(new Date())
+                    .build());
+            
+            objectInfo.setStatus(S3ObjectInfo.ProcessingStatus.PROCESSING);
+            objectInfo.setInstanceId(getInstanceId());
+            objectInfo.setRetryCount(objectInfo.getRetryCount() != null ? 
+                objectInfo.getRetryCount() + 1 : 1);
+            
+            objectRepository.save(objectInfo);
+            
+            // 4. 创建处理记录
+            ProcessedFile processedFile = ProcessedFile.builder()
+                .id(String.format("%s:%s:%d", bucket, key, 
+                    objectInfo.getRetryCount()))
+                .bucket(bucket)
+                .key(key)
+                .prefix(extractPrefix(key))
+                .status(ProcessedFile.ProcessingStatus.DOWNLOADING)
+                .instanceId(getInstanceId())
+                .processStartTime(new Date())
+                .version(objectInfo.getRetryCount())
+                .createdAt(new Date())
+                .build();
+            
+            processedRepository.save(processedFile);
+            
+            File localFile = null;
+            
+            try {
+                // 5. 下载文件
+                processedFile.setStatus(ProcessedFile.ProcessingStatus.DOWNLOADING);
+                processedRepository.save(processedFile);
+                
+                localFile = downloadFile(bucket, key);
+                processedFile.setLocalPath(localFile.getAbsolutePath());
+                processedFile.setFileSize(localFile.length());
+                
+                // 6. 获取ETag
+                String etag = getObjectEtag(bucket, key);
+                processedFile.setEtag(etag);
+                objectInfo.setEtag(etag);
+                
+                // 7. 处理文件
+                processedFile.setStatus(ProcessedFile.ProcessingStatus.PROCESSING);
+                processedRepository.save(processedFile);
+                
+                Map<String, Object> processResult = fileProcessor.process(localFile);
+                processedFile.setProcessingResult(processResult);
+                
+                // 8. 处理完成
+                processedFile.setStatus(ProcessedFile.ProcessingStatus.COMPLETED);
+                processedFile.setProcessEndTime(new Date());
+                processedFile.setDurationMs(System.currentTimeMillis() - startTime);
+                processedRepository.save(processedFile);
+                
+                objectInfo.setStatus(S3ObjectInfo.ProcessingStatus.COMPLETED);
+                objectInfo.setProcessedAt(new Date());
+                objectRepository.save(objectInfo);
+                
+                // 9. 移动文件（如果启用）
+                String archivedKey = moveAfterProcessing(bucket, key, processResult);
+                
+                if (archivedKey != null) {
+                    processedFile.setArchivedKey(archivedKey);
+                    objectInfo.setArchivedKey(archivedKey);
+                    objectInfo.setStatus(S3ObjectInfo.ProcessingStatus.ARCHIVED);
+                    
+                    processedRepository.save(processedFile);
+                    objectRepository.save(objectInfo);
+                }
+                
+                long duration = System.currentTimeMillis() - startTime;
+                
+                return ProcessingResult.builder()
+                    .success(true)
+                    .objectId(objectId)
+                    .processResult(processResult)
+                    .archivedKey(archivedKey)
+                    .durationMs(duration)
+                    .message("处理成功")
+                    .build();
+                
+            } catch (Exception e) {
+                // 处理失败
+                log.error("处理对象失败: {}/{}", bucket, key, e);
+                
+                processedFile.setStatus(ProcessedFile.ProcessingStatus.FAILED);
+                processedFile.setProcessEndTime(new Date());
+                processedFile.setDurationMs(System.currentTimeMillis() - startTime);
+                processedFile.setErrorMessage(e.getMessage());
+                processedFile.setStackTrace(getStackTrace(e));
+                processedRepository.save(processedFile);
+                
+                objectInfo.setStatus(S3ObjectInfo.ProcessingStatus.FAILED);
+                objectInfo.setErrorMessage(e.getMessage());
+                objectRepository.save(objectInfo);
+                
+                // 移动失败文件
+                moveFailedFile(bucket, key, e);
+                
+                long duration = System.currentTimeMillis() - startTime;
+                
+                return ProcessingResult.builder()
+                    .success(false)
+                    .objectId(objectId)
+                    .durationMs(duration)
+                    .errorMessage(e.getMessage())
+                    .build();
+                    
+            } finally {
+                // 清理本地文件
+                cleanupLocalFile(localFile);
+            }
+            
+        } finally {
+            // 释放锁
+            coordinator.releaseLock("process:" + bucket + ":" + key);
+        }
+    }
+    
+    /**
+     * 批量处理对象
+     */
+    public BatchProcessingResult batchProcessObjects(List<S3ObjectInfo> objects) {
+        BatchProcessingResult result = new BatchProcessingResult();
+        AtomicInteger completed = new AtomicInteger(0);
+        
+        objects.parallelStream().forEach(obj -> {
+            try {
+                ProcessingResult processResult = processObject(obj.getBucket(), obj.getKey());
+                
+                synchronized (result) {
+                    if (processResult.isSuccess()) {
+                        result.addSuccess(processResult);
+                    } else {
+                        result.addFailure(obj.getBucket(), obj.getKey(), 
+                            processResult.getErrorMessage());
+                    }
+                }
+                
+                int processed = completed.incrementAndGet();
+                if (processed % 10 == 0) {
+                    log.info("批量处理进度: {}/{}", processed, objects.size());
+                }
+                
+            } catch (Exception e) {
+                log.error("批量处理失败: {}/{}", obj.getBucket(), obj.getKey(), e);
+                
+                synchronized (result) {
+                    result.addFailure(obj.getBucket(), obj.getKey(), e.getMessage());
+                }
+                
+                completed.incrementAndGet();
+            }
+        });
+        
+        return result;
+    }
+    
+    /**
+     * 下载文件
+     */
+    private File downloadFile(String bucket, String key) throws IOException {
+        String localPath = getLocalFilePath(bucket, key);
+        File localFile = new File(localPath);
+        
+        // 确保目录存在
+        localFile.getParentFile().mkdirs();
+        
+        // 检查是否已下载
+        if (localFile.exists()) {
+            long localSize = localFile.length();
+            long s3Size = getObjectSize(bucket, key);
+            
+            if (localSize == s3Size) {
+                log.debug("文件已存在: {}", localPath);
+                return localFile;
+            }
+        }
+        
+        // 下载文件
+        GetObjectRequest request = GetObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+        
+        Path downloadPath = Paths.get(localPath);
+        s3Client.getObject(request, downloadPath)
+            .get(downloadTimeout, TimeUnit.MILLISECONDS);
+        
+        return localFile;
+    }
+    
+    /**
+     * 处理成功后移动文件
+     */
+    private String moveAfterProcessing(String bucket, String key, 
+                                      Map<String, Object> processResult) {
+        try {
+            S3FileMover.MoveRequest moveRequest = S3FileMover.MoveRequest.builder()
+                .bucket(bucket)
+                .sourceKey(key)
+                .moveType(S3FileMover.MoveType.ARCHIVE)
+                .metadata(processResult)
+                .addTimestamp(true)
+                .compress(isLargeFile(bucket, key))
+                .build();
+            
+            S3FileMover.MoveResult moveResult = fileMover.move(moveRequest);
+            
+            if (moveResult.isSuccess()) {
+                log.info("文件归档成功: {} -> {}", key, moveResult.getTargetKey());
+                return moveResult.getTargetKey();
+            } else {
+                log.error("文件归档失败: {}", key);
+                return null;
+            }
+            
+        } catch (Exception e) {
+            log.error("移动文件失败: {}", key, e);
+            return null;
+        }
+    }
+    
+    /**
+     * 移动失败文件
+     */
+    private void moveFailedFile(String bucket, String key, Exception error) {
+        try {
+            S3FileMover.MoveRequest moveRequest = S3FileMover.MoveRequest.builder()
+                .bucket(bucket)
+                .sourceKey(key)
+                .moveType(S3FileMover.MoveType.FAILED)
+                .metadata(Map.of("error", error.getMessage()))
+                .addTimestamp(true)
+                .build();
+            
+            S3FileMover.MoveResult moveResult = fileMover.move(moveRequest);
+            
+            if (moveResult.isSuccess()) {
+                log.warn("失败文件已移动: {} -> {}", key, moveResult.getTargetKey());
+            }
+            
+        } catch (Exception e) {
+            log.error("移动失败文件出错: {}", key, e);
+        }
+    }
+    
+    /**
+     * 获取对象大小
+     */
+    private long getObjectSize(String bucket, String key) {
+        try {
+            return s3Client.headObject(h -> h.bucket(bucket).key(key))
+                .get(5000, TimeUnit.MILLISECONDS)
+                .contentLength();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+    
+    /**
+     * 获取对象ETag
+     */
+    private String getObjectEtag(String bucket, String key) {
+        try {
+            return s3Client.headObject(h -> h.bucket(bucket).key(key))
+                .get(5000, TimeUnit.MILLISECONDS)
+                .eTag();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+    
+    /**
+     * 检查是否是大文件
+     */
+    private boolean isLargeFile(String bucket, String key) {
+        long size = getObjectSize(bucket, key);
+        return size > 10 * 1024 * 1024;  // 大于10MB
+    }
+    
+    /**
+     * 生成本地文件路径
+     */
+    private String getLocalFilePath(String bucket, String key) {
+        String safeKey = key.replaceAll("[^a-zA-Z0-9._-]", "_");
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        
+        return String.format("%s/%s/%s_%s", 
+            downloadDir, bucket, safeKey, timestamp);
+    }
+    
+    /**
+     * 提取前缀
+     */
+    private String extractPrefix(String key) {
+        int lastSlash = key.lastIndexOf('/');
+        return lastSlash > 0 ? key.substring(0, lastSlash + 1) : "";
+    }
+    
+    /**
+     * 获取实例ID
+     */
+    private String getInstanceId() {
+        return System.getenv("HOSTNAME");
+    }
+    
+    /**
+     * 获取异常堆栈
+     */
+    private String getStackTrace(Exception e) {
+        StringBuilder sb = new StringBuilder();
+        for (StackTraceElement element : e.getStackTrace()) {
+            sb.append(element.toString()).append("\n");
+        }
+        return sb.toString();
+    }
+    
+    /**
+     * 清理本地文件
+     */
+    private void cleanupLocalFile(File file) {
+        if (file != null && file.exists()) {
+            try {
+                if (!file.delete()) {
+                    file.deleteOnExit();
+                }
+            } catch (Exception e) {
+                log.warn("清理本地文件失败: {}", file.getPath(), e);
+            }
+        }
+    }
+    
+    @Data
+    @Builder
+    public static class ProcessingResult {
+        private boolean success;
+        private String objectId;
+        private Map<String, Object> processResult;
+        private String archivedKey;
+        private long durationMs;
+        private String message;
+        private String errorMessage;
+        
+        public static ProcessingResult locked(String message) {
+            return ProcessingResult.builder()
+                .success(false)
+                .message(message)
+                .build();
+        }
+        
+        public static ProcessingResult skipped(String message) {
+            return ProcessingResult.builder()
+                .success(true)
+                .message(message)
+                .build();
+        }
+    }
+    
+    @Data
+    public static class BatchProcessingResult {
+        private final List<ProcessingResult> successes = new ArrayList<>();
+        private final List<Failure> failures = new ArrayList<>();
+        
+        public void addSuccess(ProcessingResult result) {
+            successes.add(result);
+        }
+        
+        public void addFailure(String bucket, String key, String error) {
+            failures.add(new Failure(bucket, key, error));
+        }
+        
+        public int getTotalProcessed() {
+            return successes.size() + failures.size();
+        }
+        
+        public double getSuccessRate() {
+            int total = getTotalProcessed();
+            return total > 0 ? (double) successes.size() / total * 100 : 0;
+        }
+        
+        @Data
+        @AllArgsConstructor
+        public static class Failure {
+            private String bucket;
+            private String key;
+            private String error;
+        }
+    }
+}

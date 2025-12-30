@@ -1,0 +1,28 @@
+// 性能优化策略
+@Component
+public class PerformanceOptimizer {
+    
+    /**
+     * 动态调整扫描间隔
+     */
+    public long adjustScanInterval(long currentInterval, long lastScanDuration) {
+        if (lastScanDuration > 2500) {  // 上次扫描超过2.5秒
+            return Math.min(currentInterval + 1000, 10000);  // 增加间隔，最多10秒
+        } else if (lastScanDuration < 1000) {  // 上次扫描很快
+            return Math.max(currentInterval - 500, 1000);  // 减少间隔，最少1秒
+        }
+        return currentInterval;
+    }
+    
+    /**
+     * 批量处理优化
+     */
+    public List<List<S3ObjectInfo>> batchObjects(List<S3ObjectInfo> objects, int batchSize) {
+        List<List<S3ObjectInfo>> batches = new ArrayList<>();
+        for (int i = 0; i < objects.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, objects.size());
+            batches.add(objects.subList(i, end));
+        }
+        return batches;
+    }
+}

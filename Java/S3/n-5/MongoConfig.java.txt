@@ -1,0 +1,78 @@
+// MongoConfig.java
+package com.example.s3scanner.config;
+
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.ReadConcern;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.mongodb.MongoDatabaseFactory;
+import org.springframework.data.mongodb.MongoTransactionManager;
+import org.springframework.data.mongodb.config.AbstractMongoClientConfiguration;
+import org.springframework.data.mongodb.config.EnableMongoAuditing;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.convert.MongoConverter;
+import org.springframework.data.mongodb.repository.config.EnableMongoRepositories;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+@EnableMongoAuditing
+@EnableTransactionManagement
+public class MongoConfig extends AbstractMongoClientConfiguration {
+    
+    @Value("${spring.data.mongodb.uri}")
+    private String mongoUri;
+    
+    @Override
+    protected String getDatabaseName() {
+        return "s3-scanner";
+    }
+    
+    @Override
+    public MongoClient mongoClient() {
+        ConnectionString connectionString = new ConnectionString(mongoUri);
+        
+        MongoClientSettings settings = MongoClientSettings.builder()
+            .applyConnectionString(connectionString)
+            .applyToConnectionPoolSettings(builder -> builder
+                .maxSize(100)
+                .minSize(10)
+                .maxWaitTime(30000, TimeUnit.MILLISECONDS)
+                .maxConnectionIdleTime(60000, TimeUnit.MILLISECONDS)
+                .maxConnectionLifeTime(300000, TimeUnit.MILLISECONDS)
+            )
+            .applyToSocketSettings(builder -> builder
+                .connectTimeout(10000, TimeUnit.MILLISECONDS)
+                .readTimeout(30000, TimeUnit.MILLISECONDS)
+            )
+            .applyToServerSettings(builder -> builder
+                .heartbeatFrequency(10000, TimeUnit.MILLISECONDS)
+                .minHeartbeatFrequency(500, TimeUnit.MILLISECONDS)
+            )
+            .readConcern(ReadConcern.MAJORITY)
+            .writeConcern(WriteConcern.MAJORITY.withWTimeout(10000, TimeUnit.MILLISECONDS))
+            .retryReads(true)
+            .retryWrites(true)
+            .build();
+        
+        return MongoClients.create(settings);
+    }
+    
+    @Bean
+    public MongoTransactionManager transactionManager(MongoDatabaseFactory dbFactory) {
+        return new MongoTransactionManager(dbFactory);
+    }
+    
+    @Bean
+    public MongoTemplate mongoTemplate(MongoDatabaseFactory databaseFactory, 
+                                      MongoConverter converter) {
+        MongoTemplate template = new MongoTemplate(databaseFactory, converter);
+        template.setWriteConcern(WriteConcern.MAJORITY.withWTimeout(10000, TimeUnit.MILLISECONDS));
+        return template;
+    }
+}

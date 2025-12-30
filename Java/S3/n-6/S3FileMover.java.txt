@@ -1,0 +1,271 @@
+// S3FileMover.java
+@Service
+@Slf4j
+public class S3FileMover {
+    
+    @Autowired
+    private S3AsyncClient s3Client;
+    
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    
+    @Value("${s3.move.retry-count:3}")
+    private int retryCount;
+    
+    /**
+     * 移动S3文件
+     */
+    public MoveResult moveFile(String bucket, String sourceKey, String targetKey) {
+        int attempts = 0;
+        while (attempts < retryCount) {
+            try {
+                return doMoveFile(bucket, sourceKey, targetKey);
+            } catch (Exception e) {
+                attempts++;
+                log.warn("移动文件失败，重试 {}/{}: {} -> {}", 
+                    attempts, retryCount, sourceKey, targetKey, e);
+                
+                if (attempts >= retryCount) {
+                    throw new RuntimeException("移动文件失败: " + sourceKey, e);
+                }
+                
+                try {
+                    Thread.sleep(1000 * attempts);  // 指数退避
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("移动被中断", ie);
+                }
+            }
+        }
+        throw new RuntimeException("移动文件失败: " + sourceKey);
+    }
+    
+    private MoveResult doMoveFile(String bucket, String sourceKey, String targetKey) {
+        // 1. 检查目标文件是否已存在
+        if (objectExists(bucket, targetKey)) {
+            // 添加时间戳避免冲突
+            String newTargetKey = addTimestampToKey(targetKey);
+            return doMoveFile(bucket, sourceKey, newTargetKey);
+        }
+        
+        // 2. 复制文件
+        CopyObjectRequest copyRequest = CopyObjectRequest.builder()
+            .sourceBucket(bucket)
+            .sourceKey(sourceKey)
+            .destinationBucket(bucket)
+            .destinationKey(targetKey)
+            .build();
+        
+        s3Client.copyObject(copyRequest).join();
+        
+        // 3. 验证复制成功
+        if (!verifyCopy(bucket, sourceKey, targetKey)) {
+            throw new RuntimeException("复制验证失败");
+        }
+        
+        // 4. 删除源文件
+        deleteSourceFile(bucket, sourceKey);
+        
+        // 5. 记录移动历史
+        recordMoveHistory(bucket, sourceKey, targetKey);
+        
+        return MoveResult.success(sourceKey, targetKey);
+    }
+    
+    /**
+     * 归档已处理文件
+     */
+    public MoveResult archiveProcessedFile(String bucket, String sourceKey, 
+                                          ProcessingResult result) {
+        String targetKey = generateArchiveKey(bucket, sourceKey, result);
+        return moveFile(bucket, sourceKey, targetKey);
+    }
+    
+    /**
+     * 移动失败文件
+     */
+    public MoveResult moveFailedFile(String bucket, String sourceKey, String error) {
+        String targetKey = generateFailedKey(bucket, sourceKey, error);
+        return moveFile(bucket, sourceKey, targetKey);
+    }
+    
+    /**
+     * 生成归档路径
+     */
+    private String generateArchiveKey(String bucket, String sourceKey, 
+                                     ProcessingResult result) {
+        // 示例: archive/2024/01/15/original-filename_20240115_123456.txt
+        String filename = extractFilename(sourceKey);
+        String datePath = getDatePath();
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        
+        String newFilename = filename.replaceFirst("(?=\\.)", "_" + timestamp);
+        
+        return String.format("archive/%s/%s", datePath, newFilename);
+    }
+    
+    /**
+     * 生成失败文件路径
+     */
+    private String generateFailedKey(String bucket, String sourceKey, String error) {
+        String filename = extractFilename(sourceKey);
+        String datePath = getDatePath();
+        String errorHash = Integer.toHexString(error.hashCode());
+        
+        return String.format("failed/%s/%s_%s", datePath, filename, errorHash);
+    }
+    
+    /**
+     * 按日期备份
+     */
+    public MoveResult backupByDate(String bucket, String sourceKey) {
+        String datePath = getDatePath();
+        String filename = extractFilename(sourceKey);
+        
+        String targetKey = String.format("backup/%s/%s", datePath, filename);
+        return moveFile(bucket, sourceKey, targetKey);
+    }
+    
+    /**
+     * 批量移动文件
+     */
+    public BatchMoveResult batchMoveFiles(String bucket, List<String> sourceKeys, 
+                                         String targetPrefix) {
+        BatchMoveResult result = new BatchMoveResult();
+        
+        sourceKeys.parallelStream().forEach(sourceKey -> {
+            try {
+                String filename = extractFilename(sourceKey);
+                String targetKey = targetPrefix + filename;
+                
+                MoveResult moveResult = moveFile(bucket, sourceKey, targetKey);
+                result.addSuccess(moveResult);
+            } catch (Exception e) {
+                result.addFailure(sourceKey, e.getMessage());
+            }
+        });
+        
+        return result;
+    }
+    
+    // 工具方法
+    private String extractFilename(String key) {
+        int lastSlash = key.lastIndexOf('/');
+        return lastSlash >= 0 ? key.substring(lastSlash + 1) : key;
+    }
+    
+    private String getDatePath() {
+        return new SimpleDateFormat("yyyy/MM/dd").format(new Date());
+    }
+    
+    private String addTimestampToKey(String key) {
+        int dotIndex = key.lastIndexOf('.');
+        if (dotIndex > 0) {
+            String timestamp = new SimpleDateFormat("_yyyyMMddHHmmss").format(new Date());
+            return key.substring(0, dotIndex) + timestamp + key.substring(dotIndex);
+        }
+        return key + "_" + System.currentTimeMillis();
+    }
+    
+    private boolean objectExists(String bucket, String key) {
+        try {
+            s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .build()).join();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private boolean verifyCopy(String bucket, String sourceKey, String targetKey) {
+        try {
+            HeadObjectResponse source = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(bucket)
+                .key(sourceKey)
+                .build()).join();
+            
+            HeadObjectResponse target = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(bucket)
+                .key(targetKey)
+                .build()).join();
+            
+            return source.contentLength().equals(target.contentLength()) &&
+                   source.eTag().equals(target.eTag());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private void deleteSourceFile(String bucket, String sourceKey) {
+        try {
+            s3Client.deleteObject(DeleteObjectRequest.builder()
+                .bucket(bucket)
+                .key(sourceKey)
+                .build()).join();
+        } catch (Exception e) {
+            log.error("删除源文件失败: {}", sourceKey, e);
+            throw new RuntimeException("删除源文件失败", e);
+        }
+    }
+    
+    private void recordMoveHistory(String bucket, String sourceKey, String targetKey) {
+        try {
+            MoveHistory history = MoveHistory.builder()
+                .id(UUID.randomUUID().toString())
+                .bucket(bucket)
+                .sourceKey(sourceKey)
+                .targetKey(targetKey)
+                .movedAt(new Date())
+                .fileSize(getFileSize(bucket, targetKey))
+                .build();
+            
+            mongoTemplate.save(history, "file_move_history");
+        } catch (Exception e) {
+            log.warn("记录移动历史失败", e);
+        }
+    }
+    
+    private Long getFileSize(String bucket, String key) {
+        try {
+            HeadObjectResponse response = s3Client.headObject(HeadObjectRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .build()).join();
+            return response.contentLength();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+    
+    @Data
+    @Builder
+    public static class MoveResult {
+        private boolean success;
+        private String sourceKey;
+        private String targetKey;
+        private String message;
+        private Date movedAt;
+        private Long durationMs;
+        
+        public static MoveResult success(String sourceKey, String targetKey) {
+            return MoveResult.builder()
+                .success(true)
+                .sourceKey(sourceKey)
+                .targetKey(targetKey)
+                .movedAt(new Date())
+                .message("移动成功")
+                .build();
+        }
+        
+        public static MoveResult failed(String sourceKey, String error) {
+            return MoveResult.builder()
+                .success(false)
+                .sourceKey(sourceKey)
+                .message(error)
+                .movedAt(new Date())
+                .build();
+        }
+    }
+}

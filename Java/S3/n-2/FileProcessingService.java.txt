@@ -1,0 +1,156 @@
+package com.example.s3scanner.service.processor;
+
+import com.example.s3scanner.service.mover.dto.MoveResult;
+import com.example.s3scanner.service.processor.dto.ProcessingResult;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class FileProcessingService {
+    
+    /**
+     * 处理文件并返回结果
+     */
+    public ProcessingResult processFile(String bucket, String key, File file) {
+        LocalDateTime startTime = LocalDateTime.now();
+        String resultId = UUID.randomUUID().toString();
+        
+        try {
+            // 记录处理开始
+            ProcessingResult inProgress = ProcessingResult.inProgress(bucket, key, 
+                ProcessingResult.ProcessingPhase.PROCESSING, 0);
+            inProgress.setResultId(resultId);
+            inProgress.setStartTime(startTime);
+            
+            // 1. 解析文件
+            Map<String, Object> parseResult = parseFile(file);
+            inProgress.setProgress(30);
+            inProgress.recordProcessingStep("文件解析完成");
+            inProgress.addExtractedMetadata("parseResult", parseResult);
+            
+            // 2. 处理业务逻辑
+            Map<String, Object> businessResult = processBusinessLogic(parseResult);
+            inProgress.setProgress(60);
+            inProgress.recordProcessingStep("业务处理完成");
+            inProgress.addExtractedMetadata("businessResult", businessResult);
+            
+            // 3. 生成最终结果
+            Map<String, Object> finalResult = generateFinalResult(parseResult, businessResult);
+            inProgress.setProgress(90);
+            inProgress.recordProcessingStep("结果生成完成");
+            
+            LocalDateTime endTime = LocalDateTime.now();
+            
+            // 4. 创建成功结果
+            ProcessingResult success = ProcessingResult.success(bucket, key, finalResult, 
+                startTime, endTime);
+            success.setResultId(resultId);
+            success.setFileSize(file.length());
+            success.setContentType(detectContentType(file));
+            success.addMetadata("processor", "FileProcessingService");
+            success.addMetadata("processingVersion", "1.0");
+            success.addStatistic("parseTime", parseResult.get("parseTime"));
+            success.addStatistic("processTime", businessResult.get("processTime"));
+            
+            // 5. 记录阶段耗时
+            success.recordPhaseDuration(ProcessingResult.ProcessingPhase.DOWNLOAD, 1000L);
+            success.recordPhaseDuration(ProcessingResult.ProcessingPhase.PROCESSING, 2000L);
+            
+            log.info("文件处理成功: {}, 耗时: {}", key, success.getFormattedDuration());
+            
+            return success;
+            
+        } catch (Exception e) {
+            LocalDateTime endTime = LocalDateTime.now();
+            
+            ProcessingResult failure = ProcessingResult.failure(bucket, key, e, 0, 3);
+            failure.setResultId(resultId);
+            failure.setStartTime(startTime);
+            failure.setEndTime(endTime);
+            failure.setDurationMs(failure.getProcessingDurationMs());
+            failure.addErrorDetail("filePath", file.getAbsolutePath());
+            failure.addErrorDetail("fileSize", file.length());
+            failure.addWarning("处理失败，将重试");
+            
+            log.error("文件处理失败: {}, 错误: {}", key, e.getMessage(), e);
+            
+            return failure;
+        }
+    }
+    
+    /**
+     * 处理文件并移动
+     */
+    public ProcessingResult processAndMove(String bucket, String key, File file, 
+                                          MoveResult moveResult) {
+        // 处理文件
+        ProcessingResult processResult = processFile(bucket, key, file);
+        
+        // 如果处理成功，关联移动结果
+        if (processResult.isSuccess()) {
+            processResult.setMoved(true);
+            processResult.setMoveResult(moveResult);
+            processResult.setMoveSuccess(moveResult.isSuccess());
+            processResult.setMoveType(moveResult.getMoveType() != null ? 
+                moveResult.getMoveType().name() : "ARCHIVE");
+            
+            if (moveResult.isCompressed()) {
+                processResult.setCompressed(true);
+                processResult.setOriginalSize(moveResult.getOriginalFileSize());
+                processResult.setCompressedSize(moveResult.getCompressedFileSize());
+                processResult.setCompressionRatio(moveResult.getCompressionRatio());
+            }
+            
+            processResult.recordProcessingStep("文件移动完成");
+        }
+        
+        return processResult;
+    }
+    
+    private Map<String, Object> parseFile(File file) {
+        // 解析文件的具体实现
+        Map<String, Object> result = new HashMap<>();
+        result.put("fileName", file.getName());
+        result.put("fileSize", file.length());
+        result.put("parseTime", 500L);  // 模拟解析时间
+        return result;
+    }
+    
+    private Map<String, Object> processBusinessLogic(Map<String, Object> parseResult) {
+        // 业务逻辑处理的具体实现
+        Map<String, Object> result = new HashMap<>();
+        result.put("processed", true);
+        result.put("records", 100);
+        result.put("processTime", 1000L);  // 模拟处理时间
+        return result;
+    }
+    
+    private Map<String, Object> generateFinalResult(Map<String, Object> parseResult, 
+                                                   Map<String, Object> businessResult) {
+        Map<String, Object> result = new HashMap<>();
+        result.putAll(parseResult);
+        result.putAll(businessResult);
+        result.put("timestamp", System.currentTimeMillis());
+        result.put("status", "completed");
+        return result;
+    }
+    
+    private String detectContentType(File file) {
+        // 检测内容类型的实现
+        if (file.getName().toLowerCase().endsWith(".txt")) {
+            return "text/plain";
+        } else if (file.getName().toLowerCase().endsWith(".csv")) {
+            return "text/csv";
+        } else if (file.getName().toLowerCase().endsWith(".json")) {
+            return "application/json";
+        }
+        return "application/octet-stream";
+    }
+}

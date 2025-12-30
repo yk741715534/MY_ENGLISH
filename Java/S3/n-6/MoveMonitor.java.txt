@@ -1,0 +1,30 @@
+// MoveMonitor.java
+@Component
+public class MoveMonitor {
+    
+    private final MeterRegistry meterRegistry;
+    
+    public MoveMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+    }
+    
+    public void recordMove(String moveType, boolean success, long durationMs) {
+        Timer.builder("s3.file.move.duration")
+            .description("文件移动耗时")
+            .tags("type", moveType, "success", String.valueOf(success))
+            .register(meterRegistry)
+            .record(durationMs, TimeUnit.MILLISECONDS);
+        
+        Counter.builder("s3.file.move.count")
+            .description("文件移动次数")
+            .tags("type", moveType, "success", String.valueOf(success))
+            .register(meterRegistry)
+            .increment();
+    }
+    
+    public void recordStorageUsage(String prefix, long sizeBytes) {
+        meterRegistry.gauge("s3.storage.usage.bytes", 
+            Tags.of("prefix", prefix), 
+            sizeBytes);
+    }
+}

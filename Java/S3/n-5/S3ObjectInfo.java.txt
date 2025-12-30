@@ -1,0 +1,80 @@
+package com.example.s3scanner.model.domain;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+import java.time.Instant;
+import java.util.Date;
+import java.util.Map;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Document(collection = "s3_objects")
+@CompoundIndex(name = "bucket_key_idx", def = "{'bucket': 1, 'key': 1}", unique = true)
+public class S3ObjectInfo {
+    
+    @Id
+    private String id;  // bucket:key
+    
+    @Indexed
+    private String bucket;
+    
+    @Indexed
+    private String key;
+    
+    private String etag;
+    private Long size;
+    private String storageClass;
+    
+    @Indexed
+    private Date lastModified;
+    
+    @Indexed
+    private String prefix;  // 所属前缀
+    
+    @Indexed
+    private ProcessingStatus status;
+    
+    @Indexed
+    private String instanceId;  // 当前处理的实例
+    
+    @Indexed
+    private Date processedAt;
+    
+    private Integer retryCount;
+    private String errorMessage;
+    
+    @Indexed
+    private String archivedKey;  // 归档后的路径
+    
+    @Indexed
+    private String backupKey;    // 备份路径
+    
+    @Indexed
+    private Boolean compressed;  // 是否压缩
+    
+    private Map<String, Object> metadata;
+    
+    @Indexed(expireAfterSeconds = 2592000)  // 30天后自动删除
+    private Date createdAt;
+    
+    @Field("_version")
+    private Long version = 1L;
+    
+    public enum ProcessingStatus {
+        PENDING,
+        PROCESSING,
+        COMPLETED,
+        FAILED,
+        ARCHIVED,
+        DELETED
+    }
+}

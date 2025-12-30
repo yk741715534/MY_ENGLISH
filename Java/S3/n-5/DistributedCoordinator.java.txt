@@ -1,0 +1,424 @@
+package com.example.s3scanner.service.coordinator;
+
+import com.example.s3scanner.model.domain.InstanceInfo;
+import com.example.s3scanner.repository.InstanceInfoRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import javax.annotation.PostConstruct;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedCoordinator {
+    
+    private final MongoTemplate mongoTemplate;
+    private final InstanceInfoRepository instanceRepository;
+    
+    @Value("${app.instance.id}")
+    private String instanceId;
+    
+    @Value("${app.instance.concurrency-limit}")
+    private int concurrencyLimit;
+    
+    @Value("${app.lock.coordination-ttl-ms}")
+    private long coordinationTtl;
+    
+    private volatile String assignedPartition;
+    private final AtomicInteger currentLoad = new AtomicInteger(0);
+    private final Map<String, LeaseInfo> activeLeases = new ConcurrentHashMap<>();
+    
+    /**
+     * 租约信息
+     */
+    @Data
+    @Builder
+    public static class LeaseInfo {
+        private String lockKey;
+        private String ownerId;
+        private Date acquiredAt;
+        private Date expiresAt;
+        private int version;
+    }
+    
+    /**
+     * 初始化实例注册
+     */
+    @PostConstruct
+    public void init() {
+        registerInstance();
+        startHeartbeat();
+        assignPartition();
+    }
+    
+    /**
+     * 注册实例
+     */
+    private void registerInstance() {
+        InstanceInfo instance = InstanceInfo.builder()
+            .instanceId(instanceId)
+            .hostname(getHostname())
+            .status(InstanceInfo.InstanceStatus.STARTING)
+            .startedAt(new Date())
+            .concurrencyLimit(concurrencyLimit)
+            .currentLoad(0)
+            .capabilities(Map.of(
+                "s3.scan", true,
+                "s3.process", true,
+                "s3.move", true
+            ))
+            .build();
+        
+        instanceRepository.save(instance);
+        log.info("实例注册成功: {}", instanceId);
+    }
+    
+    /**
+     * 启动心跳
+     */
+    private void startHeartbeat() {
+        Timer timer = new Timer("instance-heartbeat", true);
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                updateHeartbeat();
+            }
+        }, 0, 30000);  // 每30秒心跳一次
+    }
+    
+    /**
+     * 更新心跳
+     */
+    private void updateHeartbeat() {
+        try {
+            Update update = new Update()
+                .set("lastHeartbeat", new Date())
+                .set("expiresAt", new Date(System.currentTimeMillis() + 90000))
+                .set("currentLoad", currentLoad.get())
+                .set("status", InstanceInfo.InstanceStatus.RUNNING)
+                .inc("_version", 1);
+            
+            mongoTemplate.updateFirst(
+                new Query(Criteria.where("_id").is(instanceId)),
+                update,
+                InstanceInfo.class
+            );
+        } catch (Exception e) {
+            log.error("更新心跳失败", e);
+        }
+    }
+    
+    /**
+     * 分配分区
+     */
+    private void assignPartition() {
+        List<InstanceInfo> activeInstances = getActiveInstances();
+        Collections.sort(activeInstances, Comparator.comparing(InstanceInfo::getInstanceId));
+        
+        int index = -1;
+        for (int i = 0; i < activeInstances.size(); i++) {
+            if (activeInstances.get(i).getInstanceId().equals(instanceId)) {
+                index = i;
+                break;
+            }
+        }
+        
+        if (index != -1) {
+            assignedPartition = String.format("partition-%d-of-%d", index, activeInstances.size());
+            
+            Update update = new Update()
+                .set("partitionKey", assignedPartition)
+                .inc("_version", 1);
+            
+            mongoTemplate.updateFirst(
+                new Query(Criteria.where("_id").is(instanceId)),
+                update,
+                InstanceInfo.class
+            );
+            
+            log.info("实例 {} 分配分区: {}", instanceId, assignedPartition);
+        }
+    }
+    
+    /**
+     * 获取活动实例
+     */
+    private List<InstanceInfo> getActiveInstances() {
+        Date cutoff = new Date(System.currentTimeMillis() - 90000);  // 90秒内活跃
+        
+        Query query = new Query(Criteria.where("lastHeartbeat").gt(cutoff)
+            .and("status").is(InstanceInfo.InstanceStatus.RUNNING));
+        
+        return mongoTemplate.find(query, InstanceInfo.class);
+    }
+    
+    /**
+     * 获取协调锁
+     */
+    public boolean acquireCoordinationLock(String lockKey, long ttlMs) {
+        String lockId = "coordination:" + lockKey;
+        
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + ttlMs);
+            
+            Query query = new Query(Criteria.where("_id").is(lockId)
+                .orOperator(
+                    Criteria.where("expiresAt").lt(now),
+                    Criteria.where("expiresAt").exists(false)
+                ));
+            
+            Update update = new Update()
+                .set("ownerId", instanceId)
+                .set("expiresAt", expiresAt)
+                .set("acquiredAt", now)
+                .set("version", 1)
+                .setOnInsert("_id", lockId);
+            
+            LeaseInfo existing = mongoTemplate.findAndModify(query, update, 
+                LeaseInfo.class, "distributed_locks");
+            
+            if (existing != null && instanceId.equals(existing.getOwnerId())) {
+                activeLeases.put(lockId, LeaseInfo.builder()
+                    .lockKey(lockId)
+                    .ownerId(instanceId)
+                    .acquiredAt(now)
+                    .expiresAt(expiresAt)
+                    .version(1)
+                    .build());
+                
+                return true;
+            }
+            
+            return false;
+        } catch (Exception e) {
+            log.error("获取协调锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 获取处理锁
+     */
+    public boolean acquireProcessLock(String bucket, String key, long ttlMs) {
+        String lockId = String.format("process:%s:%s", bucket, key);
+        
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + ttlMs);
+            
+            Query query = new Query(Criteria.where("_id").is(lockId)
+                .orOperator(
+                    Criteria.where("expiresAt").lt(now),
+                    Criteria.where("expiresAt").exists(false)
+                ));
+            
+            Update update = new Update()
+                .set("ownerId", instanceId)
+                .set("expiresAt", expiresAt)
+                .set("acquiredAt", now)
+                .set("resource", String.format("%s/%s", bucket, key))
+                .set("type", "PROCESS")
+                .set("version", 1)
+                .setOnInsert("_id", lockId);
+            
+            LeaseInfo existing = mongoTemplate.findAndModify(query, update, 
+                LeaseInfo.class, "distributed_locks");
+            
+            if (existing != null && instanceId.equals(existing.getOwnerId())) {
+                activeLeases.put(lockId, LeaseInfo.builder()
+                    .lockKey(lockId)
+                    .ownerId(instanceId)
+                    .acquiredAt(now)
+                    .expiresAt(expiresAt)
+                    .version(1)
+                    .build());
+                
+                currentLoad.incrementAndGet();
+                return true;
+            }
+            
+            return false;
+        } catch (Exception e) {
+            log.error("获取处理锁失败: {}/{}", bucket, key, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 续期租约
+     */
+    public boolean renewLease(String lockKey, long additionalMs) {
+        LeaseInfo lease = activeLeases.get(lockKey);
+        if (lease == null || !instanceId.equals(lease.getOwnerId())) {
+            return false;
+        }
+        
+        try {
+            Date newExpiresAt = new Date(System.currentTimeMillis() + additionalMs);
+            
+            Update update = new Update()
+                .set("expiresAt", newExpiresAt)
+                .inc("version", 1);
+            
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("ownerId").is(instanceId)
+                .and("version").is(lease.getVersion()));
+            
+            UpdateResult result = mongoTemplate.updateFirst(query, update, "distributed_locks");
+            
+            if (result.getModifiedCount() > 0) {
+                lease.setExpiresAt(newExpiresAt);
+                lease.setVersion(lease.getVersion() + 1);
+                return true;
+            }
+            
+            return false;
+        } catch (Exception e) {
+            log.error("续期租约失败: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 释放锁
+     */
+    public boolean releaseLock(String lockKey) {
+        LeaseInfo lease = activeLeases.remove(lockKey);
+        if (lease == null) {
+            return false;
+        }
+        
+        try {
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("ownerId").is(instanceId));
+            
+            DeleteResult result = mongoTemplate.remove(query, "distributed_locks");
+            
+            if (result.getDeletedCount() > 0) {
+                if (lockKey.startsWith("process:")) {
+                    currentLoad.decrementAndGet();
+                }
+                return true;
+            }
+            
+            return false;
+        } catch (Exception e) {
+            log.error("释放锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 批量续期所有租约
+     */
+    @Scheduled(fixedDelay = 10000)  // 每10秒续期一次
+    public void renewAllLeases() {
+        List<String> toRemove = new ArrayList<>();
+        
+        for (Map.Entry<String, LeaseInfo> entry : activeLeases.entrySet()) {
+            String lockKey = entry.getKey();
+            LeaseInfo lease = entry.getValue();
+            
+            // 计算剩余时间
+            long remaining = lease.getExpiresAt().getTime() - System.currentTimeMillis();
+            
+            // 如果剩余时间少于1/3 TTL，则续期
+            if (remaining < coordinationTtl / 3) {
+                if (!renewLease(lockKey, coordinationTtl)) {
+                    toRemove.add(lockKey);
+                }
+            }
+        }
+        
+        // 清理失效的租约
+        toRemove.forEach(activeLeases::remove);
+    }
+    
+    /**
+     * 清理过期锁
+     */
+    @Scheduled(fixedDelay = 60000)  // 每1分钟清理一次
+    public void cleanupExpiredLocks() {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - 60000);  // 过期1分钟以上的锁
+            
+            Query query = new Query(Criteria.where("expiresAt").lt(cutoff));
+            DeleteResult result = mongoTemplate.remove(query, "distributed_locks");
+            
+            if (result.getDeletedCount() > 0) {
+                log.debug("清理了 {} 个过期锁", result.getDeletedCount());
+            }
+        } catch (Exception e) {
+            log.error("清理过期锁失败", e);
+        }
+    }
+    
+    /**
+     * 获取主机名
+     */
+    private String getHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+    
+    /**
+     * 获取当前负载
+     */
+    public int getCurrentLoad() {
+        return currentLoad.get();
+    }
+    
+    /**
+     * 获取分配的分区
+     */
+    public String getAssignedPartition() {
+        return assignedPartition;
+    }
+    
+    /**
+     * 是否应该处理指定key
+     */
+    public boolean shouldProcess(String bucket, String key) {
+        if (assignedPartition == null) {
+            return false;
+        }
+        
+        // 一致性哈希：根据bucket:key计算哈希值
+        String resource = bucket + ":" + key;
+        int hash = Math.abs(resource.hashCode());
+        
+        // 解析分区信息 partition-X-of-Y
+        String[] parts = assignedPartition.split("-");
+        if (parts.length < 4) {
+            return false;
+        }
+        
+        try {
+            int partitionIndex = Integer.parseInt(parts[1]);
+            int totalPartitions = Integer.parseInt(parts[3]);
+            
+            int hashRange = Integer.MAX_VALUE / totalPartitions;
+            int startHash = partitionIndex * hashRange;
+            int endHash = (partitionIndex + 1) * hashRange - 1;
+            
+            return hash >= startHash && hash <= endHash;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+}

@@ -1,0 +1,84 @@
+package com.example.s3scanner.service.mover;
+
+import com.example.s3scanner.service.mover.dto.MoveRequest;
+import com.example.s3scanner.service.mover.dto.MoveResult;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.util.UUID;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class S3FileMoverService {
+    
+    /**
+     * 示例：移动文件到归档目录
+     */
+    public MoveResult archiveFile(String bucket, String sourceKey, Map<String, Object> processResult) {
+        MoveRequest request = MoveRequest.builder()
+            .bucket(bucket)
+            .sourceKey(sourceKey)
+            .moveType(MoveRequest.MoveType.ARCHIVE)
+            .targetPrefix("archive/")
+            .addTimestamp(true)
+            .compress(true)
+            .compressionLevel(6)
+            .keepSource(false)
+            .requestId(UUID.randomUUID().toString())
+            .operator("system")
+            .processingResult(processResult)
+            .addMetadata("processedBy", "s3-scanner")
+            .addMetadata("processTime", System.currentTimeMillis())
+            .addTag("status", "archived")
+            .addTag("source", "uploads")
+            .build();
+        
+        try {
+            // 执行移动操作
+            MoveResult result = executeMove(request);
+            
+            if (result.isSuccess()) {
+                log.info("文件归档成功: {} -> {}", 
+                    result.getSourcePath(), result.getTargetPath());
+            } else {
+                log.error("文件归档失败: {}, 错误: {}", 
+                    result.getSourcePath(), result.getErrorMessage());
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            return MoveResult.failure(request, e);
+        }
+    }
+    
+    /**
+     * 示例：处理失败文件
+     */
+    public MoveResult moveFailedFile(String bucket, String sourceKey, Exception error) {
+        MoveRequest request = MoveRequest.createFailedRequest(bucket, sourceKey, error);
+        request.setRequestId(UUID.randomUUID().toString());
+        request.setOperator("error-handler");
+        
+        try {
+            MoveResult result = executeMove(request);
+            
+            if (result.isSuccess()) {
+                log.warn("失败文件已移动: {} -> {}", 
+                    result.getSourcePath(), result.getTargetPath());
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            return MoveResult.failure(request, e);
+        }
+    }
+    
+    private MoveResult executeMove(MoveRequest request) {
+        // 这里实现实际的移动逻辑
+        // 返回成功或失败结果
+        return MoveResult.success(request, "archive/2024/01/15/file.txt", 1024L);
+    }
+}

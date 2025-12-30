@@ -1,0 +1,279 @@
+package com.example.s3scanner.service.mover;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.model.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+import java.io.*;
+
+@Service
+@Slf4j
+public class S3FileMover {
+    
+    private final S3AsyncClient s3Client;
+    
+    @Value("${app.mover.archive-prefix:archive/}")
+    private String archivePrefix;
+    
+    @Value("${app.mover.backup-prefix:backup/}")
+    private String backupPrefix;
+    
+    @Value("${app.mover.failed-prefix:failed/}")
+    private String failedPrefix;
+    
+    @Value("${app.mover.add-timestamp}")
+    private boolean addTimestamp;
+    
+    @Value("${app.mover.compress-large-files}")
+    private boolean compressLargeFiles;
+    
+    @Value("${app.mover.compress-threshold-mb}")
+    private int compressThresholdMb;
+    
+    public S3FileMover(S3AsyncClient s3Client) {
+        this.s3Client = s3Client;
+    }
+    
+    /**
+     * 移动文件
+     */
+    public MoveResult move(MoveRequest request) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            String targetKey = generateTargetKey(request);
+            
+            // 复制文件
+            CopyObjectRequest copyRequest = CopyObjectRequest.builder()
+                .sourceBucket(request.getBucket())
+                .sourceKey(request.getSourceKey())
+                .destinationBucket(request.getBucket())
+                .destinationKey(targetKey)
+                .metadata(request.getMetadata())
+                .metadataDirective(MetadataDirective.REPLACE)
+                .build();
+            
+            CompletableFuture<CopyObjectResponse> copyFuture = s3Client.copyObject(copyRequest);
+            CopyObjectResponse response = copyFuture.get(30, TimeUnit.SECONDS);
+            
+            // 验证复制
+            if (!verifyCopy(request.getBucket(), request.getSourceKey(), targetKey)) {
+                throw new RuntimeException("Copy verification failed");
+            }
+            
+            // 删除源文件
+            deleteSourceFile(request.getBucket(), request.getSourceKey());
+            
+            long duration = System.currentTimeMillis() - startTime;
+            
+            return MoveResult.builder()
+                .success(true)
+                .sourceKey(request.getSourceKey())
+                .targetKey(targetKey)
+                .moveType(request.getMoveType())
+                .durationMs(duration)
+                .message("移动成功")
+                .build();
+                
+        } catch (Exception e) {
+            log.error("移动文件失败: {}", request.getSourceKey(), e);
+            
+            long duration = System.currentTimeMillis() - startTime;
+            
+            return MoveResult.builder()
+                .success(false)
+                .sourceKey(request.getSourceKey())
+                .moveType(request.getMoveType())
+                .durationMs(duration)
+                .errorMessage(e.getMessage())
+                .build();
+        }
+    }
+    
+    /**
+     * 生成目标Key
+     */
+    private String generateTargetKey(MoveRequest request) {
+        String filename = extractFilename(request.getSourceKey());
+        String datePath = getDatePath();
+        String targetKey;
+        
+        switch (request.getMoveType()) {
+            case ARCHIVE:
+                targetKey = String.format("%s%s/%s", 
+                    archivePrefix, datePath, formatFilename(filename, request));
+                break;
+                
+            case BACKUP:
+                targetKey = String.format("%s%s/%s", 
+                    backupPrefix, datePath, formatFilename(filename, request));
+                break;
+                
+            case FAILED:
+                String errorHash = Integer.toHexString(
+                    request.getMetadata().getOrDefault("error", "").toString().hashCode());
+                targetKey = String.format("%s%s/%s_%s", 
+                    failedPrefix, datePath, formatFilename(filename, request), errorHash);
+                break;
+                
+            default:
+                throw new IllegalArgumentException("不支持的移动类型: " + request.getMoveType());
+        }
+        
+        // 检查目标Key是否已存在
+        if (objectExists(request.getBucket(), targetKey)) {
+            // 添加唯一标识
+            String uniqueId = UUID.randomUUID().toString().substring(0, 8);
+            targetKey = targetKey.replaceFirst("(?=\\.)", "_" + uniqueId);
+        }
+        
+        return targetKey;
+    }
+    
+    /**
+     * 格式化文件名
+     */
+    private String formatFilename(String filename, MoveRequest request) {
+        if (addTimestamp) {
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss")
+                .format(new Date());
+            
+            int dotIndex = filename.lastIndexOf('.');
+            if (dotIndex > 0) {
+                return filename.substring(0, dotIndex) + "_" + timestamp + 
+                       filename.substring(dotIndex);
+            } else {
+                return filename + "_" + timestamp;
+            }
+        }
+        
+        return filename;
+    }
+    
+    /**
+     * 压缩并移动
+     */
+    public MoveResult compressAndMove(MoveRequest request) throws IOException {
+        String tempFile = null;
+        
+        try {
+            // 1. 下载文件
+            File original = downloadToTemp(request.getBucket(), request.getSourceKey());
+            tempFile = original.getAbsolutePath();
+            
+            // 2. 压缩
+            File compressed = compressFile(original);
+            
+            // 3. 上传压缩文件
+            String compressedKey = generateTargetKey(request).replaceFirst("(?=\\.)", "_compressed");
+            
+            s3Client.putObject(PutObjectRequest.builder()
+                .bucket(request.getBucket())
+                .key(compressedKey)
+                .contentType("application/zip")
+                .build(), compressed.toPath())
+                .get(30, TimeUnit.SECONDS);
+            
+            // 4. 删除源文件
+            deleteSourceFile(request.getBucket(), request.getSourceKey());
+            
+            return MoveResult.builder()
+                .success(true)
+                .sourceKey(request.getSourceKey())
+                .targetKey(compressedKey)
+                .moveType(request.getMoveType())
+                .compressed(true)
+                .originalSize(original.length())
+                .compressedSize(compressed.length())
+                .compressionRatio((double) compressed.length() / original.length())
+                .message("压缩并移动成功")
+                .build();
+                
+        } finally {
+            // 清理临时文件
+            if (tempFile != null) {
+                new File(tempFile).delete();
+            }
+        }
+    }
+    
+    /**
+     * 批量移动
+     */
+    public BatchMoveResult batchMove(List<MoveRequest> requests) {
+        BatchMoveResult result = new BatchMoveResult();
+        
+        List<CompletableFuture<MoveResult>> futures = requests.stream()
+            .map(request -> CompletableFuture.supplyAsync(() -> move(request)))
+            .collect(Collectors.toList());
+        
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .thenAccept(v -> {
+                for (int i = 0; i < futures.size(); i++) {
+                    try {
+                        MoveResult moveResult = futures.get(i).get();
+                        if (moveResult.isSuccess()) {
+                            result.addSuccess(moveResult);
+                        } else {
+                            result.addFailure(requests.get(i).getSourceKey(), 
+                                moveResult.getErrorMessage());
+                        }
+                    } catch (Exception e) {
+                        result.addFailure(requests.get(i).getSourceKey(), e.getMessage());
+                    }
+                }
+            })
+            .join();
+        
+        return result;
+    }
+    
+    /**
+     * 验证复制
+     */
+    private boolean verifyCopy(String bucket, String sourceKey, String targetKey) {
+        try {
+            HeadObjectResponse source = s3Client.headObject(h -> h
+                .bucket(bucket)
+                .key(sourceKey))
+                .get(5, TimeUnit.SECONDS);
+            
+            HeadObjectResponse target = s3Client.headObject(h -> h
+                .bucket(bucket)
+                .key(targetKey))
+                .get(5, TimeUnit.SECONDS);
+            
+            return source.contentLength().equals(target.contentLength()) &&
+                   source.eTag().equals(target.eTag());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    /**
+     * 删除源文件
+     */
+    private void deleteSourceFile(String bucket, String key) {
+        try {
+            s3Client.deleteObject(h -> h.bucket(bucket).key(key))
+                .get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.error("删除源文件失败: {}", key, e);
+        }
+    }
+    
+    /**
+     * 检查对象是否存在
+     */
+    private boolean objectExists(String bucket, String key

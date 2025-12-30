@@ -1,0 +1,62 @@
+package com.example.s3scanner.model.domain;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+import java.util.Date;
+import java.util.Map;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Document(collection = "instance_registry")
+public class InstanceInfo {
+    
+    @Id
+    private String instanceId;
+    
+    @Indexed
+    private String hostname;
+    
+    private String ipAddress;
+    private Integer port;
+    private String appName;
+    private String version;
+    
+    @Indexed
+    private String partitionKey;  // 一致性哈希分配的分区
+    
+    @Indexed
+    private Date lastHeartbeat;
+    
+    @Indexed(expireAfterSeconds = 90)  // 90秒无心跳自动清理
+    private Date expiresAt;
+    
+    @Indexed
+    private InstanceStatus status;
+    
+    private Integer concurrencyLimit = 20;
+    private Integer currentLoad = 0;
+    private Long totalProcessed = 0L;
+    private Long totalFailed = 0L;
+    
+    private Date startedAt;
+    private Map<String, Object> capabilities;
+    
+    @Field("_version")
+    private Long version = 1L;
+    
+    public enum InstanceStatus {
+        STARTING,
+        RUNNING,
+        DRAINING,
+        STOPPED,
+        FAILED
+    }
+}

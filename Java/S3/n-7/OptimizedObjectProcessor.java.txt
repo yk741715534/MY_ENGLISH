@@ -1,0 +1,107 @@
+// OptimizedObjectProcessor.java
+@Service
+@Slf4j
+public class OptimizedObjectProcessor {
+    
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    
+    @Autowired
+    private S3AsyncClient s3Client;
+    
+    @Autowired
+    private DownloadService downloadService;
+    
+    /**
+     * 使用MongoDB互斥锁处理对象
+     */
+    public ProcessingResult processWithMutex(String bucket, String key) {
+        String objectId = String.format("%s:%s", bucket, key);
+        
+        // 1. 快速检查是否已处理
+        if (isAlreadyProcessed(objectId)) {
+            return ProcessingResult.skipped("already processed");
+        }
+        
+        // 2. 获取对象处理锁
+        String lockKey = String.format("process:%s", objectId);
+        if (!acquireProcessLock(lockKey)) {
+            return ProcessingResult.skipped("another instance is processing");
+        }
+        
+        try {
+            // 3. 再次检查（双重检查锁模式）
+            if (isAlreadyProcessed(objectId)) {
+                return ProcessingResult.skipped("already processed by other instance");
+            }
+            
+            // 4. 下载和处理
+            File localFile = downloadService.downloadObjectWithResume(bucket, key);
+            Object result = processFile(localFile);
+            
+            // 5. 标记为已处理
+            markAsProcessed(objectId, bucket, key, result);
+            
+            return ProcessingResult.success(result);
+            
+        } catch (Exception e) {
+            log.error("处理失败: {}", key, e);
+            return ProcessingResult.failed(e.getMessage());
+        } finally {
+            releaseProcessLock(lockKey);
+        }
+    }
+    
+    private boolean acquireProcessLock(String lockKey) {
+        try {
+            Date expiresAt = new Date(System.currentTimeMillis() + 30000);  // 30秒锁
+            
+            Document result = mongoTemplate.getCollection("process_locks")
+                .findOneAndUpdate(
+                    new Document("_id", lockKey)
+                        .append("expiresAt", new Document("$lt", new Date())),
+                    new Document("$set", 
+                        new Document("expiresAt", expiresAt)
+                            .append("acquiredAt", new Date())
+                    ),
+                    new FindOneAndUpdateOptions()
+                        .upsert(true)
+                        .returnDocument(ReturnDocument.AFTER)
+                );
+            
+            return result != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private void releaseProcessLock(String lockKey) {
+        mongoTemplate.getCollection("process_locks")
+            .updateOne(
+                new Document("_id", lockKey),
+                new Document("$set", 
+                    new Document("expiresAt", new Date())  // 立即过期
+                )
+            );
+    }
+    
+    private boolean isAlreadyProcessed(String objectId) {
+        // 快速检查，使用TTL索引自动清理
+        Document processed = mongoTemplate.getCollection("processed_objects")
+            .find(new Document("_id", objectId))
+            .first();
+        
+        return processed != null;
+    }
+    
+    private void markAsProcessed(String objectId, String bucket, String key, Object result) {
+        Document doc = new Document("_id", objectId)
+            .append("bucket", bucket)
+            .append("key", key)
+            .append("processedAt", new Date())
+            .append("result", result)
+            .append("expiresAt", new Date(System.currentTimeMillis() + 86400000));  // 24小时后过期
+        
+        mongoTemplate.getCollection("processed_objects").insertOne(doc);
+    }
+}

@@ -1,0 +1,100 @@
+// LeaseBasedCoordinator.java
+@Component
+@Slf4j
+public class LeaseBasedCoordinator {
+    
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    
+    @Value("${app.instance.id}")
+    private String instanceId;
+    
+    private static final String COORDINATION_LOCK = "s3-scan-coordination";
+    private static final long LEASE_DURATION = 10000;  // 10秒租约
+    
+    /**
+     * 尝试获取协调锁
+     */
+    public boolean acquireCoordinationLock() {
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + LEASE_DURATION);
+            
+            // 使用findAndModify原子操作
+            Document result = mongoTemplate.getCollection("coordination_locks")
+                .findOneAndUpdate(
+                    new Document("_id", COORDINATION_LOCK)
+                        .append("$or", Arrays.asList(
+                            new Document("expiresAt", new Document("$lt", now)),
+                            new Document("expiresAt", new Document("$exists", false))
+                        )),
+                    new Document("$set", 
+                        new Document("ownerId", instanceId)
+                            .append("expiresAt", expiresAt)
+                            .append("acquiredAt", now)
+                    ),
+                    new FindOneAndUpdateOptions()
+                        .upsert(true)
+                        .returnDocument(ReturnDocument.AFTER)
+                );
+            
+            boolean acquired = result != null && instanceId.equals(result.getString("ownerId"));
+            if (acquired) {
+                log.debug("获取协调锁成功");
+            }
+            return acquired;
+            
+        } catch (Exception e) {
+            log.error("获取协调锁失败", e);
+            return false;
+        }
+    }
+    
+    /**
+     * 续期租约
+     */
+    public boolean renewLease() {
+        try {
+            Date newExpiresAt = new Date(System.currentTimeMillis() + LEASE_DURATION);
+            
+            UpdateResult result = mongoTemplate.getCollection("coordination_locks")
+                .updateOne(
+                    new Document("_id", COORDINATION_LOCK)
+                        .append("ownerId", instanceId),
+                    new Document("$set", 
+                        new Document("expiresAt", newExpiresAt)
+                    )
+                );
+            
+            return result.getModifiedCount() > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    /**
+     * 分配扫描范围
+     */
+    public ScanRange assignScanRange(int totalInstances, int instanceIndex) {
+        // 基于一致性哈希分配范围
+        // 例如：按文件名哈希值分配
+        
+        int hashRange = Integer.MAX_VALUE / totalInstances;
+        int startHash = instanceIndex * hashRange;
+        int endHash = (instanceIndex + 1) * hashRange - 1;
+        
+        return new ScanRange(startHash, endHash);
+    }
+    
+    @Data
+    @AllArgsConstructor
+    public static class ScanRange {
+        private int startHash;
+        private int endHash;
+        
+        public boolean shouldProcess(String key) {
+            int hash = Math.abs(key.hashCode());
+            return hash >= startHash && hash <= endHash;
+        }
+    }
+}

@@ -1,0 +1,76 @@
+// InstanceRegistry.java
+@Component
+@Slf4j
+public class InstanceRegistry {
+    
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    
+    @Value("${app.instance.id}")
+    private String instanceId;
+    
+    private volatile String partitionKey;  // 当前实例分配的分区
+    
+    /**
+     * 注册实例并获取分区
+     */
+    @PostConstruct
+    public void init() {
+        registerInstance();
+        startHeartbeat();
+    }
+    
+    private void registerInstance() {
+        // 使用一致性哈希分配分区
+        List<String> activeInstances = getActiveInstances();
+        Collections.sort(activeInstances);
+        
+        int index = activeInstances.indexOf(instanceId);
+        if (index != -1) {
+            // 根据实例数量和排序位置分配分区
+            partitionKey = calculatePartitionKey(activeInstances.size(), index);
+            log.info("实例 {} 分配分区: {}", instanceId, partitionKey);
+        }
+    }
+    
+    private String calculatePartitionKey(int totalInstances, int instanceIndex) {
+        // 简单哈希分区，可扩展为一致性哈希环
+        return String.format("partition-%d-of-%d", instanceIndex, totalInstances);
+    }
+    
+    private List<String> getActiveInstances() {
+        Date cutoff = new Date(System.currentTimeMillis() - 60000);  // 60秒内活跃
+        
+        Query query = new Query(Criteria.where("lastHeartbeat").gt(cutoff));
+        query.fields().include("instanceId");
+        
+        return mongoTemplate.find(query, InstanceInfo.class).stream()
+            .map(InstanceInfo::getInstanceId)
+            .sorted()
+            .collect(Collectors.toList());
+    }
+    
+    private void startHeartbeat() {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                Update update = new Update()
+                    .set("lastHeartbeat", new Date())
+                    .set("partitionKey", partitionKey)
+                    .set("expiresAt", new Date(System.currentTimeMillis() + 90000));  // 90秒过期
+                
+                mongoTemplate.upsert(
+                    new Query(Criteria.where("_id").is(instanceId)),
+                    update,
+                    InstanceInfo.class
+                );
+            } catch (Exception e) {
+                log.error("心跳更新失败", e);
+            }
+        }, 0, 30, TimeUnit.SECONDS);  // 每30秒心跳一次
+    }
+    
+    public String getCurrentPartition() {
+        return partitionKey;
+    }
+}

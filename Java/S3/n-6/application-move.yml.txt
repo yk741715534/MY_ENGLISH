@@ -1,0 +1,37 @@
+# 文件移动配置
+s3:
+  move:
+    enabled: true
+    strategy: ARCHIVE  # ARCHIVE, BACKUP, MOVE_AND_DELETE
+
+  # 归档配置
+  archive:
+    prefix: archive/
+    add-timestamp: true
+    date-format: yyyy/MM/dd
+    compress: false
+
+  # 备份配置
+  backup:
+    enabled: true
+    prefix: backup/
+    retention-days: 90
+
+  # 失败文件配置
+  failed:
+    prefix: failed/
+    retention-days: 7
+    add-error-hash: true
+
+  # 重试配置
+  retry:
+    max-attempts: 3
+    delay-ms: 1000
+    max-delay-ms: 10000
+
+  # 生命周期配置
+  lifecycle:
+    enabled: true
+    archive-to-glacier-days: 30
+    delete-failed-days: 7
+    delete-backup-days: 90

@@ -1,0 +1,53 @@
+// ScanPerformanceMonitor.java
+@Component
+public class ScanPerformanceMonitor {
+    
+    private final MeterRegistry meterRegistry;
+    private final LongAdder totalScanned = new LongAdder();
+    private final LongAdder totalProcessed = new LongAdder();
+    
+    public ScanPerformanceMonitor(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        
+        // 注册自定义指标
+        Gauge.builder("s3.scanner.queue.size", () -> getQueueSize())
+            .description("待处理队列大小")
+            .register(meterRegistry);
+    }
+    
+    public void recordScan(int scannedCount, int processedCount, long durationMs) {
+        totalScanned.add(scannedCount);
+        totalProcessed.add(processedCount);
+        
+        // 记录指标
+        Timer.Sample sample = Timer.start(meterRegistry);
+        sample.stop(Timer.builder("s3.scan.duration")
+            .description("扫描耗时")
+            .register(meterRegistry));
+        
+        meterRegistry.counter("s3.objects.scanned").increment(scannedCount);
+        meterRegistry.counter("s3.objects.processed").increment(processedCount);
+        
+        // 计算处理率
+        if (scannedCount > 0) {
+            double processRate = (double) processedCount / scannedCount;
+            meterRegistry.gauge("s3.scan.process.rate", processRate);
+        }
+    }
+    
+    public void recordLockAcquisition(boolean success, long durationMs) {
+        meterRegistry.counter("s3.lock.acquisition", 
+            "success", String.valueOf(success)).increment();
+        
+        Timer.builder("s3.lock.acquisition.time")
+            .description("锁获取耗时")
+            .tags("success", String.valueOf(success))
+            .register(meterRegistry)
+            .record(durationMs, TimeUnit.MILLISECONDS);
+    }
+    
+    private int getQueueSize() {
+        // 返回当前待处理队列大小
+        return 0;  // 实际实现中从队列获取
+    }
+}

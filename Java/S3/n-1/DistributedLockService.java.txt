@@ -1,0 +1,347 @@
+// DistributedLockService.java
+package com.example.s3scanner.service.coordinator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import com.example.s3scanner.exception.DistributedLockException;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedLockService {
+    
+    private final MongoTemplate mongoTemplate;
+    
+    @Value("${app.lock.coordination-ttl-ms}")
+    private long coordinationTtlMs;
+    
+    @Value("${app.lock.process-ttl-ms}")
+    private long processTtlMs;
+    
+    @Value("${app.lock.cleanup-ttl-ms}")
+    private long cleanupTtlMs;
+    
+    @Value("${app.lock.retry-interval-ms}")
+    private long retryIntervalMs;
+    
+    @Value("${app.lock.max-retries}")
+    private int maxRetries;
+    
+    @Value("${app.lock.lock-collection}")
+    private String lockCollection;
+    
+    // 本地锁缓存
+    private final Map<String, LockInfo> localLocks = new ConcurrentHashMap<>();
+    
+    @Data
+    @Builder
+    public static class LockInfo {
+        private String lockKey;
+        private String owner;
+        private String resource;
+        private Date acquiredAt;
+        private Date expiresAt;
+        private long ttlMs;
+        private int version;
+    }
+    
+    /**
+     * 获取锁
+     */
+    public boolean acquireLock(String lockKey, String resource, long ttlMs) {
+        return acquireLock(lockKey, resource, ttlMs, maxRetries, retryIntervalMs);
+    }
+    
+    /**
+     * 获取锁（带重试）
+     */
+    public boolean acquireLock(String lockKey, String resource, long ttlMs, 
+                              int maxRetries, long retryIntervalMs) {
+        String owner = getOwnerId();
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                if (tryAcquireLock(lockKey, resource, owner, ttlMs)) {
+                    log.debug("获取锁成功: {}, owner: {}", lockKey, owner);
+                    return true;
+                }
+                
+                if (attempt < maxRetries - 1) {
+                    Thread.sleep(retryIntervalMs);
+                }
+                
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new DistributedLockException("获取锁被中断: " + lockKey, e);
+            } catch (Exception e) {
+                log.error("获取锁异常: {}", lockKey, e);
+            }
+        }
+        
+        log.debug("获取锁失败: {}, owner: {}", lockKey, owner);
+        return false;
+    }
+    
+    /**
+     * 尝试获取锁
+     */
+    private boolean tryAcquireLock(String lockKey, String resource, 
+                                  String owner, long ttlMs) {
+        Date now = new Date();
+        Date expiresAt = new Date(now.getTime() + ttlMs);
+        
+        try {
+            // 使用findAndModify实现原子操作
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .orOperator(
+                    Criteria.where("expiresAt").lt(now),
+                    Criteria.where("expiresAt").exists(false)
+                ));
+            
+            Update update = new Update()
+                .set("owner", owner)
+                .set("resource", resource)
+                .set("acquiredAt", now)
+                .set("expiresAt", expiresAt)
+                .set("ttlMs", ttlMs)
+                .inc("version", 1)
+                .setOnInsert("_id", lockKey)
+                .setOnInsert("createdAt", now);
+            
+            LockInfo existing = mongoTemplate.findAndModify(
+                query, update, LockInfo.class, lockCollection
+            );
+            
+            if (existing == null || owner.equals(existing.getOwner())) {
+                // 锁获取成功，更新本地缓存
+                LockInfo lockInfo = LockInfo.builder()
+                    .lockKey(lockKey)
+                    .owner(owner)
+                    .resource(resource)
+                    .acquiredAt(now)
+                    .expiresAt(expiresAt)
+                    .ttlMs(ttlMs)
+                    .version(existing != null ? existing.getVersion() + 1 : 1)
+                    .build();
+                
+                localLocks.put(lockKey, lockInfo);
+                return true;
+            }
+            
+            return false;
+            
+        } catch (Exception e) {
+            log.error("尝试获取锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 释放锁
+     */
+    public boolean releaseLock(String lockKey, String resource) {
+        String owner = getOwnerId();
+        
+        try {
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("owner").is(owner)
+                .and("resource").is(resource));
+            
+            // 设置过期时间为过去，让锁立即失效
+            Update update = new Update()
+                .set("expiresAt", new Date(System.currentTimeMillis() - 1000));
+            
+            boolean released = mongoTemplate.updateFirst(query, update, lockCollection)
+                .getModifiedCount() > 0;
+            
+            if (released) {
+                localLocks.remove(lockKey);
+                log.debug("释放锁成功: {}, owner: {}", lockKey, owner);
+            } else {
+                log.warn("释放锁失败，锁可能已过期或被其他人持有: {}, owner: {}", lockKey, owner);
+            }
+            
+            return released;
+            
+        } catch (Exception e) {
+            log.error("释放锁异常: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 续期锁
+     */
+    public boolean renewLock(String lockKey, long additionalTtlMs) {
+        LockInfo lockInfo = localLocks.get(lockKey);
+        if (lockInfo == null || !getOwnerId().equals(lockInfo.getOwner())) {
+            return false;
+        }
+        
+        try {
+            Date newExpiresAt = new Date(System.currentTimeMillis() + additionalTtlMs);
+            
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("owner").is(lockInfo.getOwner())
+                .and("resource").is(lockInfo.getResource())
+                .and("version").is(lockInfo.getVersion()));
+            
+            Update update = new Update()
+                .set("expiresAt", newExpiresAt)
+                .inc("version", 1);
+            
+            boolean renewed = mongoTemplate.updateFirst(query, update, lockCollection)
+                .getModifiedCount() > 0;
+            
+            if (renewed) {
+                lockInfo.setExpiresAt(newExpiresAt);
+                lockInfo.setVersion(lockInfo.getVersion() + 1);
+                lockInfo.setTtlMs(additionalTtlMs);
+                log.debug("续期锁成功: {}, 新过期时间: {}", lockKey, newExpiresAt);
+            }
+            
+            return renewed;
+            
+        } catch (Exception e) {
+            log.error("续期锁异常: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 获取锁的所有者
+     */
+    public String getLockOwner(String lockKey) {
+        try {
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("expiresAt").gt(new Date()));
+            
+            LockInfo lockInfo = mongoTemplate.findOne(query, LockInfo.class, lockCollection);
+            return lockInfo != null ? lockInfo.getOwner() : null;
+            
+        } catch (Exception e) {
+            log.error("获取锁所有者异常: {}", lockKey, e);
+            return null;
+        }
+    }
+    
+    /**
+     * 检查锁是否存在
+     */
+    public boolean isLocked(String lockKey) {
+        try {
+            Query query = new Query(Criteria.where("_id").is(lockKey)
+                .and("expiresAt").gt(new Date()));
+            
+            return mongoTemplate.exists(query, lockCollection);
+            
+        } catch (Exception e) {
+            log.error("检查锁状态异常: {}", lockKey, e);
+            return false;
+        }
+    }
+    
+    /**
+     * 批量续期本地持有的所有锁
+     */
+    @Scheduled(fixedDelay = 30000)  // 每30秒续期一次
+    public void renewAllLocalLocks() {
+        String owner = getOwnerId();
+        List<String> toRemove = new ArrayList<>();
+        
+        for (Map.Entry<String, LockInfo> entry : localLocks.entrySet()) {
+            String lockKey = entry.getKey();
+            LockInfo lockInfo = entry.getValue();
+            
+            if (!owner.equals(lockInfo.getOwner())) {
+                toRemove.add(lockKey);
+                continue;
+            }
+            
+            // 计算剩余时间
+            long remaining = lockInfo.getExpiresAt().getTime() - System.currentTimeMillis();
+            
+            // 如果剩余时间少于1/3 TTL，则续期
+            if (remaining < lockInfo.getTtlMs() / 3) {
+                if (!renewLock(lockKey, lockInfo.getTtlMs())) {
+                    toRemove.add(lockKey);
+                }
+            }
+        }
+        
+        // 清理失效的锁
+        toRemove.forEach(localLocks::remove);
+    }
+    
+    /**
+     * 清理过期锁
+     */
+    @Scheduled(fixedDelay = 60000)  // 每1分钟清理一次
+    public void cleanupExpiredLocks() {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - cleanupTtlMs);
+            
+            Query query = new Query(Criteria.where("expiresAt").lt(cutoff));
+            long deleted = mongoTemplate.remove(query, lockCollection).getDeletedCount();
+            
+            if (deleted > 0) {
+                log.debug("清理了 {} 个过期锁", deleted);
+            }
+        } catch (Exception e) {
+            log.error("清理过期锁异常", e);
+        }
+    }
+    
+    /**
+     * 获取锁统计信息
+     */
+    public Map<String, Object> getLockStats() {
+        Map<String, Object> stats = new HashMap<>();
+        
+        try {
+            // 活跃锁数量
+            Query activeQuery = new Query(Criteria.where("expiresAt").gt(new Date()));
+            long activeCount = mongoTemplate.count(activeQuery, lockCollection);
+            
+            // 按所有者统计
+            List<Map> ownerStats = mongoTemplate.aggregate(
+                mongoTemplate.aggregation(
+                    mongoTemplate.aggregation.match(Criteria.where("expiresAt").gt(new Date())),
+                    mongoTemplate.aggregation.group("owner").count().as("count"),
+                    mongoTemplate.aggregation.sort(mongoTemplate.sort(Sort.Direction.DESC, "count"))
+                ), lockCollection, Map.class
+            ).getMappedResults();
+            
+            stats.put("activeLocks", activeCount);
+            stats.put("localLocks", localLocks.size());
+            stats.put("ownerStats", ownerStats);
+            stats.put("collection", lockCollection);
+            
+        } catch (Exception e) {
+            log.error("获取锁统计信息异常", e);
+        }
+        
+        return stats;
+    }
+    
+    /**
+     * 获取所有者ID
+     */
+    private String getOwnerId() {
+        return System.getenv().getOrDefault("HOSTNAME", 
+            System.getenv().getOrDefault("POD_NAME", 
+                "instance-" + UUID.randomUUID().toString().substring(0, 8)));
+    }
+}
