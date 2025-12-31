@@ -1,0 +1,1464 @@
+ownerId 是每个实例一个唯一id还是每次获取uuid
+ownerId 的设计选择
+
+ownerId 应该是每个实例一个唯一ID，而不是每次获取UUID。​ 让我详细解释原因和最佳实践。
+
+1. 两种方式的对比
+1.1 每次生成UUID（不推荐）
+java
+下载
+复制
+// 不推荐的方式
+public String getOwnerId() {
+    return UUID.randomUUID().toString();
+}
+
+// 问题：
+// 1. 同一个实例的多次锁获取，ownerId不同
+// 2. 无法正确释放锁（因为释放时需要相同ownerId）
+// 3. 无法跟踪是哪个实例持有了锁
+1.2 每个实例固定ID（推荐）
+java
+下载
+复制
+// 推荐的方式
+@Component
+public class InstanceIdentity {
+
+    private final String instanceId;
+
+    public InstanceIdentity() {
+        // 启动时生成固定ID
+        this.instanceId = generateInstanceId();
+    }
+
+    public String getInstanceId() {
+        return instanceId;
+    }
+
+    private String generateInstanceId() {
+        // 组合多种信息生成唯一ID
+        StringBuilder sb = new StringBuilder();
+
+        // 1. 主机名
+        try {
+            String hostname = InetAddress.getLocalHost().getHostName();
+            sb.append(hostname).append("-");
+        } catch (Exception e) {
+            sb.append("unknown-host-");
+        }
+
+        // 2. IP地址最后一段
+        try {
+            String ip = InetAddress.getLocalHost().getHostAddress();
+            String[] parts = ip.split("\\.");
+            if (parts.length == 4) {
+                sb.append(parts[3]).append("-");
+            }
+        } catch (Exception e) {
+            // 忽略
+        }
+
+        // 3. 进程ID
+        long pid = ProcessHandle.current().pid();
+        sb.append(pid).append("-");
+
+        // 4. 启动时间戳
+        sb.append(System.currentTimeMillis()).append("-");
+
+        // 5. 随机数防止冲突
+        sb.append(UUID.randomUUID().toString().substring(0, 8));
+
+        return sb.toString();
+    }
+}
+2. 为什么应该使用固定实例ID
+2.1 锁的可追踪性
+java
+下载
+复制
+// 固定ID：可以追踪哪个实例持有锁
+String instanceId = "app-server-192-168-1-100-8080";
+
+// 在监控中可以清晰看到
+Map<String, Object> lockInfo = Map.of(
+    "lockKey", "process:file123.txt",
+    "owner", instanceId,           // 清晰可读
+    "instance", "app-server-192-168-1-100",
+    "port", "8080",
+    "acquiredAt", "2024-01-15T10:30:00"
+);
+
+// 随机UUID：难以追踪
+Map<String, Object> badLockInfo = Map.of(
+    "lockKey", "process:file123.txt",
+    "owner", "a1b2c3d4-e5f6-7890-abcd-ef1234567890",  // 无意义
+    "acquiredAt", "2024-01-15T10:30:00"
+);
+2.2 锁的正确释放
+java
+下载
+复制
+// 固定ID：可以正确释放
+public class DistributedLockService {
+
+    private final String instanceId;  // 固定ID
+
+    public boolean acquireLock(String lockKey, long ttlMs) {
+        return doAcquireLock(lockKey, instanceId, ttlMs);
+    }
+
+    public boolean releaseLock(String lockKey) {
+        return doReleaseLock(lockKey, instanceId);  // 使用相同ID
+    }
+}
+
+// 随机UUID：无法释放
+public class BadLockService {
+
+    public boolean acquireLock(String lockKey, long ttlMs) {
+        String randomOwner = UUID.randomUUID().toString();  // 每次不同
+        return doAcquireLock(lockKey, randomOwner, ttlMs);
+    }
+
+    public boolean releaseLock(String lockKey) {
+        // 问题：不知道用哪个ownerId来释放！
+        String randomOwner = ???;  // 应该用哪个？
+        return doReleaseLock(lockKey, randomOwner);
+    }
+}
+2.3 锁的续期
+java
+下载
+复制
+// 固定ID：可以续期
+public boolean renewLock(String lockKey) {
+    return doRenewLock(lockKey, instanceId, 30000);
+}
+
+// 随机UUID：无法续期（不知道原来的ownerId）
+public boolean renewLock(String lockKey) {
+    // 需要查询数据库找到原来的ownerId
+    LockInfo lockInfo = lockRepository.findByLockKey(lockKey);
+    if (lockInfo == null) {
+        return false;
+    }
+
+    String originalOwner = lockInfo.getOwner();
+    return doRenewLock(lockKey, originalOwner, 30000);
+}
+3. 完整的实例ID管理
+3.1 实例标识管理器
+java
+下载
+复制
+package com.example.s3scanner.service.coordinator;
+
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.annotation.Bean;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Component
+@Slf4j
+public class InstanceIdentityManager {
+
+    // 实例元数据
+    @Data
+    public static class InstanceMetadata {
+        private final String instanceId;
+        private final String hostname;
+        private final String ipAddress;
+        private final long pid;
+        private final long startupTime;
+        private final int port;
+        private final String zone;
+        private final String region;
+        private final Map<String, Object> capabilities = new HashMap<>();
+        private final AtomicLong lockCounter = new AtomicLong(0);
+        private final AtomicLong processedCounter = new AtomicLong(0);
+
+        public void incrementLockCount() {
+            lockCounter.incrementAndGet();
+        }
+
+        public void incrementProcessedCount() {
+            processedCounter.incrementAndGet();
+        }
+
+        public Map<String, Object> toMap() {
+            Map<String, Object> map = new HashMap<>();
+            map.put("instanceId", instanceId);
+            map.put("hostname", hostname);
+            map.put("ipAddress", ipAddress);
+            map.put("pid", pid);
+            map.put("startupTime", startupTime);
+            map.put("port", port);
+            map.put("zone", zone);
+            map.put("region", region);
+            map.put("totalLocksAcquired", lockCounter.get());
+            map.put("totalProcessed", processedCounter.get());
+            map.put("capabilities", capabilities);
+            return map;
+        }
+    }
+
+    private InstanceMetadata metadata;
+
+    @Value("${server.port:8080}")
+    private int serverPort;
+
+    @Value("${app.instance.zone:default-zone}")
+    private String zone;
+
+    @Value("${app.instance.region:default-region}")
+    private String region;
+
+    /**
+     * 初始化实例标识
+     */
+    @PostConstruct
+    public void init() {
+        this.metadata = createInstanceMetadata();
+        log.info("实例初始化完成: {}", metadata.getInstanceId());
+        log.info("实例详情: {}", metadata.toMap());
+    }
+
+    /**
+     * 创建实例元数据
+     */
+    private InstanceMetadata createInstanceMetadata() {
+        try {
+            // 获取主机信息
+            InetAddress localHost = InetAddress.getLocalHost();
+            String hostname = localHost.getHostName();
+            String ipAddress = localHost.getHostAddress();
+
+            // 进程ID
+            long pid = ProcessHandle.current().pid();
+
+            // 启动时间
+            long startupTime = System.currentTimeMillis();
+
+            // 生成实例ID
+            String instanceId = generateInstanceId(hostname, ipAddress, pid, startupTime);
+
+            // 能力集
+            Map<String, Object> capabilities = new HashMap<>();
+            capabilities.put("s3.scan", true);
+            capabilities.put("s3.process", true);
+            capabilities.put("s3.move", true);
+            capabilities.put("distributed.lock", true);
+            capabilities.put("heartbeat", true);
+
+            return new InstanceMetadata(
+                instanceId,
+                hostname,
+                ipAddress,
+                pid,
+                startupTime,
+                serverPort,
+                zone,
+                region
+            );
+
+        } catch (UnknownHostException e) {
+            log.error("无法获取主机信息", e);
+
+            // 回退方案
+            return new InstanceMetadata(
+                "unknown-" + UUID.randomUUID().toString(),
+                "unknown",
+                "127.0.0.1",
+                -1,
+                System.currentTimeMillis(),
+                serverPort,
+                zone,
+                region
+            );
+        }
+    }
+
+    /**
+     * 生成实例ID
+     */
+    private String generateInstanceId(String hostname, String ipAddress,
+                                     long pid, long startupTime) {
+        // 格式: {hostname}-{ip-suffix}-{pid}-{timestamp}-{random}
+        StringBuilder sb = new StringBuilder();
+
+        // 1. 主机名（清理特殊字符）
+        String safeHostname = hostname.replaceAll("[^a-zA-Z0-9-]", "-");
+        sb.append(safeHostname).append("-");
+
+        // 2. IP最后一段
+        String[] ipParts = ipAddress.split("\\.");
+        if (ipParts.length == 4) {
+            sb.append(ipParts[3]).append("-");
+        } else {
+            sb.append("0-");
+        }
+
+        // 3. 进程ID
+        sb.append(pid).append("-");
+
+        // 4. 启动时间戳（简短格式）
+        String timestamp = Long.toString(startupTime, 36);  // 36进制缩短
+        sb.append(timestamp.substring(Math.max(0, timestamp.length() - 6))).append("-");
+
+        // 5. 随机后缀（防止冲突）
+        String randomSuffix = UUID.randomUUID().toString()
+            .replaceAll("-", "")
+            .substring(0, 6)
+            .toLowerCase();
+        sb.append(randomSuffix);
+
+        return sb.toString().toLowerCase();
+    }
+
+    /**
+     * 获取实例ID
+     */
+    public String getInstanceId() {
+        return metadata.getInstanceId();
+    }
+
+    /**
+     * 获取完整元数据
+     */
+    public InstanceMetadata getMetadata() {
+        return metadata;
+    }
+
+    /**
+     * 获取实例统计
+     */
+    public Map<String, Object> getInstanceStats() {
+        return metadata.toMap();
+    }
+
+    /**
+     * 注册实例能力
+     */
+    public void registerCapability(String capability, Object value) {
+        metadata.getCapabilities().put(capability, value);
+    }
+
+    /**
+     * 增加锁计数
+     */
+    public void incrementLockCount() {
+        metadata.incrementLockCount();
+    }
+
+    /**
+     * 增加处理计数
+     */
+    public void incrementProcessedCount() {
+        metadata.incrementProcessedCount();
+    }
+}
+3.2 分布式锁服务集成
+java
+下载
+复制
+@Service
+@RequiredArgsConstructor
+public class DistributedLockService {
+
+    private final InstanceIdentityManager identityManager;
+    private final MongoTemplate mongoTemplate;
+
+    /**
+     * 获取锁
+     */
+    public boolean acquireLock(String lockKey, long ttlMs, String resource) {
+        String instanceId = identityManager.getInstanceId();
+
+        try {
+            boolean acquired = doAcquireLock(lockKey, instanceId, ttlMs, resource);
+
+            if (acquired) {
+                identityManager.incrementLockCount();
+                log.info("实例 {} 获取锁成功: {}", instanceId, lockKey);
+            }
+
+            return acquired;
+
+        } catch (Exception e) {
+            log.error("获取锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 释放锁
+     */
+    public boolean releaseLock(String lockKey) {
+        String instanceId = identityManager.getInstanceId();
+        return doReleaseLock(lockKey, instanceId);
+    }
+
+    /**
+     * 续期锁
+     */
+    public boolean renewLock(String lockKey, long additionalTtlMs) {
+        String instanceId = identityManager.getInstanceId();
+        return doRenewLock(lockKey, instanceId, additionalTtlMs);
+    }
+
+    /**
+     * 获取当前实例持有的锁
+     */
+    public List<LockInfo> getCurrentInstanceLocks() {
+        String instanceId = identityManager.getInstanceId();
+
+        Query query = new Query(Criteria.where("owner").is(instanceId)
+            .and("status").is("ACTIVE")
+            .and("expiresAt").gt(new Date()));
+
+        return mongoTemplate.find(query, LockInfo.class, "distributed_locks");
+    }
+}
+4. Kubernetes/Docker 环境优化
+4.1 容器化环境实例ID
+java
+下载
+复制
+@Component
+public class ContainerInstanceIdentity {
+
+    private final String instanceId;
+
+    public ContainerInstanceIdentity(
+            @Value("${HOSTNAME:}") String hostname,
+            @Value("${POD_NAME:}") String podName,
+            @Value("${POD_IP:}") String podIp,
+            @Value("${CONTAINER_ID:}") String containerId) {
+
+        // Kubernetes/Docker 环境优先使用环境变量
+        if (podName != null && !podName.isEmpty()) {
+            this.instanceId = podName;
+        } else if (hostname != null && !hostname.isEmpty()) {
+            this.instanceId = hostname;
+        } else {
+            // 回退到传统方式
+            this.instanceId = generateFallbackId();
+        }
+
+        log.info("容器实例ID: {}, Pod: {}, IP: {}, Container: {}",
+            instanceId, podName, podIp, containerId);
+    }
+
+    public String getInstanceId() {
+        return instanceId;
+    }
+}
+4.2 多环境实例ID生成器
+java
+下载
+复制
+@Component
+public class EnvironmentAwareInstanceIdGenerator {
+
+    public String generateInstanceId() {
+        // 1. 检查Kubernetes环境
+        String podName = System.getenv("POD_NAME");
+        if (podName != null && !podName.isEmpty()) {
+            return "k8s-" + podName;
+        }
+
+        // 2. 检查Docker环境
+        String containerId = System.getenv("HOSTNAME");
+        if (containerId != null && !containerId.isEmpty() &&
+            containerId.matches("[a-f0-9]{12}")) {
+            return "docker-" + containerId;
+        }
+
+        // 3. 检查ECS环境
+        String ecsTaskArn = System.getenv("ECS_CONTAINER_METADATA_URI");
+        if (ecsTaskArn != null) {
+            return "ecs-" + extractEcsId(ecsTaskArn);
+        }
+
+        // 4. 传统环境
+        return generateTraditionalInstanceId();
+    }
+
+    private String extractEcsId(String metadataUri) {
+        try {
+            // 从元数据URI提取ID
+            java.net.URI uri = new java.net.URI(metadataUri);
+            String path = uri.getPath();
+            String[] parts = path.split("/");
+            if (parts.length >= 3) {
+                return parts[2];  // task ID
+            }
+        } catch (Exception e) {
+            // 忽略
+        }
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+}
+5. 监控和调试
+5.1 实例注册表
+java
+下载
+复制
+@Repository
+public interface InstanceRegistryRepository extends MongoRepository<InstanceRecord, String> {
+
+    Optional<InstanceRecord> findByInstanceId(String instanceId);
+
+    List<InstanceRecord> findByStatus(String status);
+
+    @Query("{ 'lastHeartbeat': { $lt: ?0 } }")
+    List<InstanceRecord> findExpiredInstances(Date cutoff);
+}
+
+@Component
+public class InstanceRegistryService {
+
+    @Scheduled(fixedDelay = 30000)
+    public void registerInstance() {
+        String instanceId = identityManager.getInstanceId();
+        InstanceMetadata metadata = identityManager.getMetadata();
+
+        InstanceRecord record = InstanceRecord.builder()
+            .instanceId(instanceId)
+            .hostname(metadata.getHostname())
+            .ipAddress(metadata.getIpAddress())
+            .status("ACTIVE")
+            .lastHeartbeat(new Date())
+            .expiresAt(new Date(System.currentTimeMillis() + 90000))  // 90秒
+            .metadata(metadata.toMap())
+            .lockCount(metadata.getLockCounter().get())
+            .processedCount(metadata.getProcessedCounter().get())
+            .build();
+
+        instanceRegistryRepository.save(record);
+    }
+
+    /**
+     * 查找锁的所有者信息
+     */
+    public Map<String, Object> getLockOwnerInfo(String lockKey) {
+        LockInfo lock = lockService.getLockInfo(lockKey);
+        if (lock == null) {
+            return Map.of("found", false);
+        }
+
+        Optional<InstanceRecord> instance = instanceRegistryRepository
+            .findByInstanceId(lock.getOwner());
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("found", true);
+        result.put("lock", lock);
+        result.put("owner", lock.getOwner());
+        result.put("ownerInfo", instance.orElse(null));
+
+        return result;
+    }
+}
+6. 最佳实践总结
+6.1 应该使用固定实例ID的原因
+
+可追踪性：知道哪个实例持有了锁
+
+正确释放：只有获取锁的实例才能释放它
+
+续期支持：可以正确续期
+
+监控调试：便于问题排查
+
+安全控制：防止其他实例误释放锁
+
+6.2 实例ID的生成策略
+java
+下载
+复制
+// 优先级
+1. 容器环境变量 (POD_NAME, HOSTNAME)
+2. 主机名 + IP + PID
+3. 随机生成（最后的手段）
+
+// 格式建议
+// Kubernetes: k8s-{namespace}-{pod-name}-{container-name}
+// Docker: docker-{container-id}
+// 物理机: {hostname}-{ip-suffix}-{pid}
+6.3 在你的S3扫描系统中的配置
+yaml
+复制
+# application.yml
+app:
+  instance:
+    # 优先使用环境变量
+    id: ${POD_NAME:${HOSTNAME:}}
+
+    # 如果没有环境变量，使用自动生成
+    auto-generate: true
+
+    # ID前缀
+    prefix: s3-scanner
+
+    # 是否在ID中包含区域信息
+    include-region: true
+
+    # 是否包含时间戳
+    include-timestamp: true
+6.4 简化实现
+java
+下载
+复制
+@Component
+public class SimpleInstanceIdProvider {
+
+    @Getter
+    private final String instanceId;
+
+    public SimpleInstanceIdProvider() {
+        this.instanceId = generateInstanceId();
+    }
+
+    private String generateInstanceId() {
+        // 1. 尝试从环境变量获取
+        String podName = System.getenv("POD_NAME");
+        if (podName != null && !podName.isEmpty()) {
+            return podName;
+        }
+
+        String hostname = System.getenv("HOSTNAME");
+        if (hostname != null && !hostname.isEmpty()) {
+            return hostname;
+        }
+
+        // 2. 生成固定ID
+        try {
+            String localHostname = InetAddress.getLocalHost().getHostName();
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String random = UUID.randomUUID().toString().substring(0, 6);
+
+            return String.format("%s-%s-%s",
+                localHostname, timestamp, random).toLowerCase();
+
+        } catch (Exception e) {
+            // 3. 最后手段：纯随机
+            return "instance-" + UUID.randomUUID().toString();
+        }
+    }
+}
+总结
+
+在分布式锁系统中，ownerId应该是每个实例的固定唯一ID，而不是每次随机生成UUID。
+
+核心原因：
+
+锁的完整性：确保只有获取锁的实例能释放它
+
+可观测性：便于监控和调试
+
+正确性：支持锁续期和健康检查
+
+安全性：防止锁被误释放
+
+在你的S3扫描系统中，建议：
+
+java
+下载
+复制
+// 启动时生成固定ID
+@Component
+public class InstanceIdentity {
+    private final String instanceId = generateFixedId();
+
+    public String getInstanceId() {
+        return instanceId;  // 始终返回相同的ID
+    }
+}
+
+这样设计可以确保分布式锁系统的正确性和可靠性。
+
+k8s docker 部署实例时，            String hostname = InetAddress.getLocalHost().getHostName();String ip = InetAddress.getLocalHost().getHostAddress(); 这些方法获取是容器里的还是宿主机的
+
+在 Kubernetes/Docker 中获取主机信息的真相
+
+在容器内部，InetAddress.getLocalHost()获取的是容器内部的信息，不是宿主机信息。
+
+让我详细解释：
+
+1. 实际测试
+1.1 测试代码
+java
+下载
+复制
+package com.example.demo;
+
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
+public class ContainerHostInfoTest {
+    public static void main(String[] args) throws UnknownHostException {
+        InetAddress localHost = InetAddress.getLocalHost();
+
+        System.out.println("========== 容器内信息 ==========");
+        System.out.println("Host Name: " + localHost.getHostName());
+        System.out.println("Canonical Host Name: " + localHost.getCanonicalHostName());
+        System.out.println("Host Address: " + localHost.getHostAddress());
+        System.out.println("Loopback Address: " + localHost.isLoopbackAddress());
+
+        // 环境变量
+        System.out.println("\n========== 环境变量 ==========");
+        System.out.println("HOSTNAME: " + System.getenv("HOSTNAME"));
+        System.out.println("POD_NAME: " + System.getenv("POD_NAME"));
+        System.out.println("POD_IP: " + System.getenv("POD_IP"));
+        System.out.println("KUBERNETES_SERVICE_HOST: " + System.getenv("KUBERNETES_SERVICE_HOST"));
+    }
+}
+1.2 实际运行结果
+bash
+复制
+# 在容器内运行的结果
+========== 容器内信息 ==========
+Host Name: my-app-5f6d8c4b9-abc123
+Canonical Host Name: my-app-5f6d8c4b9-abc123
+Host Address: 172.17.0.5
+Loopback Address: false
+
+========== 环境变量 ==========
+HOSTNAME: my-app-5f6d8c4b9-abc123
+POD_NAME: my-app-5f6d8c4b9-abc123
+POD_IP: 10.244.1.5
+KUBERNETES_SERVICE_HOST: 10.96.0.1
+2. 不同环境对比
+2.1 Kubernetes Pod
+java
+下载
+复制
+// 在Kubernetes Pod中
+InetAddress.getLocalHost().getHostName();
+// 返回: pod-name (如: my-app-5f6d8c4b9-abc123)
+// 这是容器的主机名，由k8s设置
+
+InetAddress.getLocalHost().getHostAddress();
+// 返回: 172.17.0.5 (容器内部IP，在Pod网络命名空间内)
+// 不是Node IP，也不是Service IP
+2.2 Docker 容器
+java
+下载
+复制
+// 在Docker容器中
+InetAddress.getLocalHost().getHostName();
+// 返回: container-id (如: 3a7b8c9d0e1f)
+// Docker默认使用容器ID作为主机名
+
+InetAddress.getLocalHost().getHostAddress();
+// 返回: 172.17.0.3 (Docker网络中的容器IP)
+2.3 宿主机
+java
+下载
+复制
+// 在物理机/虚拟机上
+InetAddress.getLocalHost().getHostName();
+// 返回: server-01.example.com (实际主机名)
+
+InetAddress.getLocalHost().getHostAddress();
+// 返回: 192.168.1.100 (宿主机IP)
+3. 正确获取信息的方法
+3.1 完整的实例ID生成器
+java
+下载
+复制
+package com.example.s3scanner.service.coordinator;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Component
+@Slf4j
+public class ContainerAwareInstanceIdGenerator {
+
+    // 实例元数据
+    @lombok.Data
+    public static class InstanceMetadata {
+        private final String instanceId;
+        private final String hostname;
+        private final String containerHostname;  // 容器内主机名
+        private final String containerIp;        // 容器内IP
+        private final String podIp;              // Pod IP (k8s)
+        private final String nodeIp;             // Node IP (k8s)
+        private final String podName;            // Pod名称
+        private final String namespace;          // 命名空间
+        private final String containerId;        // 容器ID
+        private final boolean isContainer;
+        private final boolean isKubernetes;
+        private final Map<String, String> labels = new HashMap<>();
+        private final AtomicLong lockCounter = new AtomicLong(0);
+    }
+
+    private InstanceMetadata metadata;
+
+    @Value("${app.instance.id:}")
+    private String configuredInstanceId;
+
+    @PostConstruct
+    public void init() {
+        this.metadata = collectInstanceMetadata();
+        log.info("实例元数据收集完成: {}", metadata.getInstanceId());
+        log.info("元数据详情: {}", metadata);
+    }
+
+    /**
+     * 收集完整的实例元数据
+     */
+    private InstanceMetadata collectInstanceMetadata() {
+        String instanceId = generateInstanceId();
+
+        return InstanceMetadata.builder()
+            .instanceId(instanceId)
+            .hostname(getBestHostname())
+            .containerHostname(getContainerHostname())
+            .containerIp(getContainerIp())
+            .podIp(getPodIp())
+            .nodeIp(getNodeIp())
+            .podName(getPodName())
+            .namespace(getNamespace())
+            .containerId(getContainerId())
+            .isContainer(isRunningInContainer())
+            .isKubernetes(isRunningInKubernetes())
+            .labels(collectLabels())
+            .build();
+    }
+
+    /**
+     * 生成实例ID
+     */
+    private String generateInstanceId() {
+        // 1. 使用配置的ID
+        if (configuredInstanceId != null && !configuredInstanceId.trim().isEmpty()) {
+            return configuredInstanceId.trim();
+        }
+
+        // 2. 尝试获取Pod名称
+        String podName = getPodName();
+        if (podName != null && !podName.isEmpty()) {
+            return podName;
+        }
+
+        // 3. 尝试获取容器ID
+        String containerId = getContainerId();
+        if (containerId != null && !containerId.isEmpty()) {
+            return "container-" + containerId;
+        }
+
+        // 4. 回退到综合ID
+        return generateFallbackId();
+    }
+
+    /**
+     * 获取最佳主机名
+     */
+    public String getBestHostname() {
+        // 优先级
+        String[] candidates = {
+            getPodName(),                    // 1. Pod名称
+            getContainerHostname(),          // 2. 容器主机名
+            getEnvHostname(),               // 3. HOSTNAME环境变量
+            getInetHostname(),              // 4. InetAddress.getLocalHost()
+            generateFallbackId()            // 5. 回退
+        };
+
+        for (String candidate : candidates) {
+            if (candidate != null && !candidate.trim().isEmpty()) {
+                return candidate.trim();
+            }
+        }
+
+        return "unknown-host";
+    }
+
+    /**
+     * 获取容器内主机名
+     */
+    public String getContainerHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 获取容器内IP
+     */
+    public String getContainerIp() {
+        try {
+            return InetAddress.getLocalHost().getHostAddress();
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 获取Pod IP (k8s特有)
+     */
+    public String getPodIp() {
+        // Kubernetes设置的环境变量
+        return System.getenv("POD_IP");
+    }
+
+    /**
+     * 获取Node IP (k8s特有)
+     */
+    public String getNodeIp() {
+        return System.getenv("NODE_IP");
+    }
+
+    /**
+     * 获取Pod名称
+     */
+    public String getPodName() {
+        // Kubernetes设置的环境变量
+        return System.getenv("POD_NAME");
+    }
+
+    /**
+     * 获取命名空间
+     */
+    public String getNamespace() {
+        return System.getenv("POD_NAMESPACE");
+    }
+
+    /**
+     * 获取容器ID
+     */
+    public String getContainerId() {
+        // Docker/Kubernetes容器ID
+        String hostname = System.getenv("HOSTNAME");
+        if (hostname != null && hostname.matches("[a-f0-9]{12}")) {
+            return hostname;  // Docker容器ID通常是12位十六进制
+        }
+
+        // 尝试从/proc文件系统获取
+        if (isRunningInContainer()) {
+            try {
+                String hostnameContent = java.nio.file.Files.readString(
+                    java.nio.file.Paths.get("/etc/hostname")
+                ).trim();
+                if (hostnameContent.matches("[a-f0-9]{12}")) {
+                    return hostnameContent;
+                }
+            } catch (Exception e) {
+                // 忽略
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 检查是否在容器中运行
+     */
+    public boolean isRunningInContainer() {
+        // 方法1: 检查/.dockerenv文件
+        if (new java.io.File("/.dockerenv").exists()) {
+            return true;
+        }
+
+        // 方法2: 检查/proc/1/cgroup
+        try {
+            String cgroup = java.nio.file.Files.readString(
+                java.nio.file.Paths.get("/proc/1/cgroup")
+            );
+            return cgroup.contains("docker") || cgroup.contains("kubepods");
+        } catch (Exception e) {
+            // 忽略
+        }
+
+        // 方法3: 检查环境变量
+        if (System.getenv("KUBERNETES_SERVICE_HOST") != null) {
+            return true;
+        }
+
+        if (System.getenv("container") != null) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 检查是否在Kubernetes中运行
+     */
+    public boolean isRunningInKubernetes() {
+        // Kubernetes会设置特定的环境变量
+        if (System.getenv("KUBERNETES_SERVICE_HOST") != null) {
+            return true;
+        }
+
+        // 检查service account token
+        if (new java.io.File("/var/run/secrets/kubernetes.io/serviceaccount/token").exists()) {
+            return true;
+        }
+
+        // 检查Pod相关的环境变量
+        if (System.getenv("POD_NAME") != null ||
+            System.getenv("POD_IP") != null ||
+            System.getenv("POD_NAMESPACE") != null) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 从环境变量获取主机名
+     */
+    private String getEnvHostname() {
+        return System.getenv("HOSTNAME");
+    }
+
+    /**
+     * 从InetAddress获取主机名
+     */
+    private String getInetHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 收集标签
+     */
+    private Map<String, String> collectLabels() {
+        Map<String, String> labels = new HashMap<>();
+
+        // 应用标签
+        labels.put("app", System.getenv("APP_NAME"));
+        labels.put("version", System.getenv("APP_VERSION"));
+        labels.put("environment", System.getenv("ENVIRONMENT"));
+
+        // Kubernetes标签
+        if (isRunningInKubernetes()) {
+            labels.put("kubernetes.io/hostname", System.getenv("NODE_NAME"));
+            labels.put("kubernetes.io/namespace", getNamespace());
+
+            // 尝试从Downward API获取更多标签
+            try {
+                // 读取Pod标签文件
+                String podLabelsPath = "/etc/podinfo/labels";
+                if (new java.io.File(podLabelsPath).exists()) {
+                    String labelsContent = java.nio.file.Files.readString(
+                        java.nio.file.Paths.get(podLabelsPath)
+                    );
+
+                    for (String line : labelsContent.split("\n")) {
+                        String[] parts = line.split("=", 2);
+                        if (parts.length == 2) {
+                            String key = parts[0].trim();
+                            String value = parts[1].trim().replace("\"", "");
+                            if (!key.isEmpty() && !value.isEmpty()) {
+                                labels.put(key, value);
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // 忽略
+            }
+        }
+
+        return labels;
+    }
+
+    /**
+     * 生成回退ID
+     */
+    private String generateFallbackId() {
+        try {
+            // 组合多种信息
+            String timestamp = Long.toString(System.currentTimeMillis(), 36);
+            String random = UUID.randomUUID().toString().substring(0, 6);
+
+            String hostPart = "unknown";
+            try {
+                hostPart = InetAddress.getLocalHost().getHostName();
+            } catch (Exception e) {
+                // 忽略
+            }
+
+            return String.format("%s-%s-%s",
+                hostPart.replaceAll("[^a-zA-Z0-9]", "-"),
+                timestamp.substring(Math.max(0, timestamp.length() - 6)),
+                random
+            ).toLowerCase();
+
+        } catch (Exception e) {
+            return "instance-" + UUID.randomUUID().toString();
+        }
+    }
+
+    /**
+     * 获取实例ID
+     */
+    public String getInstanceId() {
+        return metadata.getInstanceId();
+    }
+
+    /**
+     * 获取完整元数据
+     */
+    public InstanceMetadata getMetadata() {
+        return metadata;
+    }
+
+    /**
+     * 获取网络信息摘要
+     */
+    public Map<String, Object> getNetworkSummary() {
+        Map<String, Object> summary = new HashMap<>();
+
+        try {
+            // 获取所有网络接口
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+
+            List<Map<String, Object>> interfaceList = new ArrayList<>();
+
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+
+                if (iface.isUp() && !iface.isLoopback() && !iface.isVirtual()) {
+                    Map<String, Object> ifaceInfo = new HashMap<>();
+                    ifaceInfo.put("name", iface.getName());
+                    ifaceInfo.put("displayName", iface.getDisplayName());
+
+                    List<String> addresses = new ArrayList<>();
+                    Enumeration<InetAddress> inetAddresses = iface.getInetAddresses();
+
+                    while (inetAddresses.hasMoreElements()) {
+                        InetAddress addr = inetAddresses.nextElement();
+                        if (!addr.isLoopbackAddress()) {
+                            addresses.add(addr.getHostAddress());
+                        }
+                    }
+
+                    ifaceInfo.put("addresses", addresses);
+                    interfaceList.add(ifaceInfo);
+                }
+            }
+
+            summary.put("networkInterfaces", interfaceList);
+
+        } catch (SocketException e) {
+            summary.put("error", e.getMessage());
+        }
+
+        return summary;
+    }
+}
+4. 实际部署配置
+4.1 Docker部署
+dockerfile
+复制
+FROM openjdk:17-jdk-slim
+
+# 设置容器主机名
+ARG CONTAINER_HOSTNAME
+ENV HOSTNAME=${CONTAINER_HOSTNAME}
+
+# 复制应用
+COPY target/app.jar app.jar
+
+# 运行应用
+ENTRYPOINT ["java", "-jar", "app.jar"]
+yaml
+复制
+# docker-compose.yml
+version: '3.8'
+services:
+  s3-scanner-1:
+    build: .
+    hostname: s3-scanner-1
+    environment:
+      - HOSTNAME=s3-scanner-1
+      - CONTAINER_ID=${HOSTNAME}
+    networks:
+      - s3-network
+
+  s3-scanner-2:
+    build: .
+    hostname: s3-scanner-2
+    environment:
+      - HOSTNAME=s3-scanner-2
+      - CONTAINER_ID=${HOSTNAME}
+    networks:
+      - s3-network
+4.2 Kubernetes部署
+yaml
+复制
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-scanner
+  labels:
+    app: s3-scanner
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: s3-scanner
+  template:
+    metadata:
+      labels:
+        app: s3-scanner
+    spec:
+      containers:
+      - name: s3-scanner
+        image: s3-scanner:latest
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: APP_INSTANCE_ID
+          value: "s3-scanner-$(POD_NAME)"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+---
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-scanner
+spec:
+  selector:
+    app: s3-scanner
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+4.3 应用配置
+yaml
+复制
+# application-k8s.yml
+app:
+  instance:
+    # 使用Pod名称作为实例ID
+    id: ${POD_NAME:}
+
+  # 网络配置
+  network:
+    advertise-address: ${POD_IP:}
+    bind-address: 0.0.0.0
+    port: 8080
+
+  # 发现配置
+  discovery:
+    enabled: true
+    cluster-name: ${POD_NAMESPACE:default}-s3-scanner
+    initial-instances:
+      - ${POD_NAME:}
+5. 获取宿主机信息的替代方案
+5.1 在Kubernetes中获取Node信息
+java
+下载
+复制
+@Component
+public class KubernetesNodeInfo {
+
+    /**
+     * 通过Kubernetes API获取Node信息
+     */
+    public Map<String, Object> getNodeInfo() throws IOException {
+        if (!isRunningInKubernetes()) {
+            return Map.of("error", "Not running in Kubernetes");
+        }
+
+        String nodeName = System.getenv("NODE_NAME");
+        if (nodeName == null) {
+            return Map.of("error", "NODE_NAME not set");
+        }
+
+        // 读取Service Account Token
+        String token = readFile("/var/run/secrets/kubernetes.io/serviceaccount/token");
+        String namespace = readFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace");
+
+        // 调用Kubernetes API
+        String apiServer = System.getenv("KUBERNETES_SERVICE_HOST");
+        String apiPort = System.getenv("KUBERNETES_SERVICE_PORT");
+
+        String url = String.format("https://%s:%s/api/v1/nodes/%s",
+            apiServer, apiPort, nodeName);
+
+        // 这里需要实现HTTPS调用
+        // 注意：需要处理证书认证
+
+        return Map.of(
+            "nodeName", nodeName,
+            "namespace", namespace,
+            "apiServer", apiServer + ":" + apiPort
+        );
+    }
+
+    private String readFile(String path) throws IOException {
+        return java.nio.file.Files.readString(java.nio.file.Paths.get(path)).trim();
+    }
+}
+5.2 通过Downward API获取信息
+yaml
+复制
+# 在Pod spec中添加
+spec:
+  containers:
+  - name: s3-scanner
+    env:
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    - name: NODE_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    volumeMounts:
+    - name: podinfo
+      mountPath: /etc/podinfo
+
+  volumes:
+  - name: podinfo
+    downwardAPI:
+      items:
+      - path: "labels"
+        fieldRef:
+          fieldPath: metadata.labels
+      - path: "annotations"
+        fieldRef:
+          fieldPath: metadata.annotations
+6. 最佳实践总结
+6.1 在容器中获取信息的正确方法
+java
+下载
+复制
+// 错误：以为获取的是宿主机信息
+String hostname = InetAddress.getLocalHost().getHostName();  // 容器主机名
+String ip = InetAddress.getLocalHost().getHostAddress();     // 容器IP
+
+// 正确：使用环境变量
+String podName = System.getenv("POD_NAME");      // Kubernetes Pod名称
+String podIp = System.getenv("POD_IP");          // Pod IP
+String nodeName = System.getenv("NODE_NAME");    // Node名称
+String hostname = System.getenv("HOSTNAME");     // 容器主机名
+6.2 实例ID生成策略
+java
+下载
+复制
+public String getInstanceId() {
+    // 优先级
+    return Optional.ofNullable(System.getenv("POD_NAME"))
+        .or(() -> Optional.ofNullable(System.getenv("HOSTNAME")))
+        .or(() -> Optional.ofNullable(generateFromInetAddress()))
+        .orElseGet(() -> generateFallbackId());
+}
+6.3 在你的S3扫描系统中的实现
+java
+下载
+复制
+@Component
+public class S3ScannerInstanceIdentity {
+
+    @Getter
+    private final String instanceId;
+
+    public S3ScannerInstanceIdentity() {
+        this.instanceId = resolveInstanceId();
+    }
+
+    private String resolveInstanceId() {
+        // 1. 从环境变量获取（K8s/Docker设置）
+        String podName = System.getenv("POD_NAME");
+        if (podName != null && !podName.isEmpty()) {
+            return "k8s-pod-" + podName;
+        }
+
+        String hostname = System.getenv("HOSTNAME");
+        if (hostname != null && !hostname.isEmpty()) {
+            if (hostname.matches("[a-f0-9]{12}")) {
+                return "docker-" + hostname;  // Docker容器ID
+            }
+            return "container-" + hostname;
+        }
+
+        // 2. 从InetAddress获取（容器内信息）
+        try {
+            String containerHostname = InetAddress.getLocalHost().getHostName();
+            if (isLikelyContainerId(containerHostname)) {
+                return "container-" + containerHostname;
+            }
+        } catch (Exception e) {
+            // 忽略
+        }
+
+        // 3. 生成唯一ID
+        return "instance-" + UUID.randomUUID().toString();
+    }
+
+    private boolean isLikelyContainerId(String hostname) {
+        // Docker容器ID通常是12位十六进制
+        return hostname != null && hostname.matches("[a-f0-9]{12}");
+    }
+}
+重要结论
+
+InetAddress.getLocalHost()在容器中获取的是容器内部的信息，不是宿主机信息。
+
+正确做法：
+
+在Kubernetes中，使用环境变量：POD_NAME, POD_IP, NODE_NAME
+
+在Docker中，使用环境变量：HOSTNAME
+
+回退方案：InetAddress.getLocalHost()+ 唯一后缀
+
+在你的分布式锁系统中，实例ID应该是：
+
+在K8s中：使用Pod名称
+
+在Docker中：使用容器ID
+
+在物理机中：使用主机名+其他标识
+
+始终保证在集群内唯一
