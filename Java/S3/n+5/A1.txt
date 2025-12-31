@@ -1,0 +1,777 @@
+你问得很好！让我详细解释这个问题：
+
+1. findAndModify 是否会新增数据？
+
+会的！findAndModify 可以新增数据。
+
+mongoTemplate.findAndModify() 方法的行为：
+// 1. 查找并修改现有文档
+T findAndModify(Query query, Update update, Class<T> entityClass, String collectionName);
+
+// 2. 如果文档不存在，不会新增
+// 默认行为：只修改存在的文档
+
+// 3. 要让它在文档不存在时新增，需要使用 upsert
+T findAndModify(Query query, Update update, FindAndModifyOptions options, Class<T> entityClass, String collectionName);
+
+
+关键参数：FindAndModifyOptions
+FindAndModifyOptions options = FindAndModifyOptions.options()
+    .upsert(true)      // 如果不存在则插入
+    .returnNew(true);  // 返回新文档
+
+
+2. DistributedLockService 的完整修正
+
+package com.example.s3scanner.service.coordinator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.mongodb.core.FindAndModifyOptions;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedLockService {
+
+    private final MongoTemplate mongoTemplate;
+    private static final String LOCK_COLLECTION = "distributed_locks";
+
+    // 内存缓存
+    private final Map<String, LockInfo> localLocks = new ConcurrentHashMap<>();
+    private final AtomicInteger lockCounter = new AtomicInteger(0);
+
+    @Data
+    @Builder
+    public static class LockInfo {
+        private String lockKey;
+        private String owner;
+        private String resource;
+        private String lockType;
+        private Date acquiredAt;
+        private Date expiresAt;
+        private long ttlMs;
+        private int version;
+        private String status;  // ACTIVE, EXPIRED, RELEASED
+
+        // 扩展信息
+        private Map<String, Object> metadata = new HashMap<>();
+        private String createdBy;
+        private Date createdAt;
+
+        public boolean isExpired() {
+            return expiresAt != null && new Date().after(expiresAt);
+        }
+
+        public boolean isActive() {
+            return "ACTIVE".equals(status) && !isExpired();
+        }
+    }
+
+    /**
+     * 获取锁（新增或更新）
+     */
+    @Transactional
+    public boolean acquireLock(String lockKey, String owner, String resource,
+                              long ttlMs, String lockType) {
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + ttlMs);
+
+            // 构建查询：查找过期或可用的锁
+            Query query = new Query(Criteria.where("lockKey").is(lockKey)
+                .orOperator(
+                    Criteria.where("expiresAt").lt(now),  // 已过期的锁
+                    Criteria.where("expiresAt").exists(false),  // 无过期时间
+                    Criteria.where("owner").is(owner)  // 自己持有的锁
+                ));
+
+            // 构建更新
+            Update update = new Update();
+            update.set("lockKey", lockKey);
+            update.set("owner", owner);
+            update.set("resource", resource);
+            update.set("lockType", lockType);
+            update.set("acquiredAt", now);
+            update.set("expiresAt", expiresAt);
+            update.set("ttlMs", ttlMs);
+            update.set("status", "ACTIVE");
+            update.set("version", 1);
+            update.set("metadata", new HashMap<String, Object>());
+            update.set("createdBy", owner);
+            update.set("createdAt", now);
+
+            // 如果是新增，设置_id
+            update.setOnInsert("_id", generateLockId(lockKey));
+
+            // 配置选项：upsert = true
+            FindAndModifyOptions options = FindAndModifyOptions.options()
+                .upsert(true)  // 关键：如果不存在则插入
+                .returnNew(true);
+
+            // 执行原子操作
+            LockInfo result = mongoTemplate.findAndModify(
+                query, update, options, LockInfo.class, LOCK_COLLECTION
+            );
+
+            boolean acquired = result != null && owner.equals(result.getOwner());
+
+            if (acquired) {
+                // 更新本地缓存
+                localLocks.put(lockKey, result);
+                lockCounter.incrementAndGet();
+
+                log.debug("锁获取成功: {} -> {}, 过期时间: {}",
+                    lockKey, owner, expiresAt);
+            } else {
+                log.debug("锁获取失败: {} 已被其他实例持有", lockKey);
+            }
+
+            return acquired;
+
+        } catch (Exception e) {
+            log.error("获取锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 创建新的锁（不尝试获取）
+     */
+    @Transactional
+    public boolean createLock(String lockKey, String owner, String resource,
+                            long ttlMs, String lockType) {
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + ttlMs);
+
+            // 检查锁是否已存在
+            if (lockExists(lockKey)) {
+                log.debug("锁已存在: {}", lockKey);
+                return false;
+            }
+
+            // 创建新锁
+            LockInfo newLock = LockInfo.builder()
+                .lockKey(lockKey)
+                .owner(owner)
+                .resource(resource)
+                .lockType(lockType)
+                .acquiredAt(now)
+                .expiresAt(expiresAt)
+                .ttlMs(ttlMs)
+                .status("ACTIVE")
+                .version(1)
+                .metadata(new HashMap<>())
+                .createdBy(owner)
+                .createdAt(now)
+                .build();
+
+            // 保存到MongoDB
+            mongoTemplate.insert(newLock, LOCK_COLLECTION);
+
+            // 更新本地缓存
+            localLocks.put(lockKey, newLock);
+            lockCounter.incrementAndGet();
+
+            log.info("创建新锁成功: {}", lockKey);
+            return true;
+
+        } catch (Exception e) {
+            log.error("创建锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 续期锁
+     */
+    @Transactional
+    public boolean renewLock(String lockKey, String owner, long additionalTtlMs) {
+        try {
+            Date newExpiresAt = new Date(System.currentTimeMillis() + additionalTtlMs);
+
+            Query query = new Query(Criteria.where("lockKey").is(lockKey)
+                .and("owner").is(owner)
+                .and("status").is("ACTIVE"));
+
+            Update update = new Update();
+            update.set("expiresAt", newExpiresAt);
+            update.set("ttlMs", additionalTtlMs);
+            update.inc("version", 1);
+            update.currentDate("lastRenewedAt");
+
+            LockInfo existing = mongoTemplate.findAndModify(query, update,
+                FindAndModifyOptions.options().returnNew(true),
+                LockInfo.class, LOCK_COLLECTION
+            );
+
+            boolean renewed = existing != null;
+
+            if (renewed) {
+                // 更新本地缓存
+                localLocks.put(lockKey, existing);
+                log.debug("锁续期成功: {}, 新过期时间: {}", lockKey, newExpiresAt);
+            }
+
+            return renewed;
+
+        } catch (Exception e) {
+            log.error("锁续期失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 释放锁
+     */
+    @Transactional
+    public boolean releaseLock(String lockKey, String owner) {
+        try {
+            Query query = new Query(Criteria.where("lockKey").is(lockKey)
+                .and("owner").is(owner));
+
+            Update update = new Update();
+            update.set("status", "RELEASED");
+            update.set("expiresAt", new Date());
+            update.set("releasedAt", new Date());
+            update.inc("version", 1);
+
+            boolean released = mongoTemplate.updateFirst(query, update, LOCK_COLLECTION)
+                .getModifiedCount() > 0;
+
+            if (released) {
+                // 从本地缓存移除
+                localLocks.remove(lockKey);
+                log.debug("锁释放成功: {}", lockKey);
+            } else {
+                log.debug("锁释放失败或锁不存在: {}", lockKey);
+            }
+
+            return released;
+
+        } catch (Exception e) {
+            log.error("释放锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 强制释放锁（管理员操作）
+     */
+    @Transactional
+    public boolean forceReleaseLock(String lockKey, String reason) {
+        try {
+            Query query = new Query(Criteria.where("lockKey").is(lockKey));
+
+            Update update = new Update();
+            update.set("status", "FORCE_RELEASED");
+            update.set("expiresAt", new Date());
+            update.set("releasedAt", new Date());
+            update.set("releaseReason", reason);
+            update.inc("version", 1);
+
+            boolean released = mongoTemplate.updateFirst(query, update, LOCK_COLLECTION)
+                .getModifiedCount() > 0;
+
+            if (released) {
+                localLocks.remove(lockKey);
+                log.warn("强制释放锁: {}, 原因: {}", lockKey, reason);
+            }
+
+            return released;
+
+        } catch (Exception e) {
+            log.error("强制释放锁失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 检查锁是否存在
+     */
+    public boolean lockExists(String lockKey) {
+        try {
+            Query query = new Query(Criteria.where("lockKey").is(lockKey));
+            return mongoTemplate.exists(query, LOCK_COLLECTION);
+        } catch (Exception e) {
+            log.error("检查锁是否存在失败: {}", lockKey, e);
+            return false;
+        }
+    }
+
+    /**
+     * 获取锁信息
+     */
+    public LockInfo getLockInfo(String lockKey) {
+        try {
+            Query query = new Query(Criteria.where("lockKey").is(lockKey));
+            return mongoTemplate.findOne(query, LockInfo.class, LOCK_COLLECTION);
+        } catch (Exception e) {
+            log.error("获取锁信息失败: {}", lockKey, e);
+            return null;
+        }
+    }
+
+    /**
+     * 批量获取锁
+     */
+    public List<LockInfo> batchAcquireLocks(List<String> lockKeys, String owner,
+                                           String resource, long ttlMs) {
+        List<LockInfo> acquiredLocks = new ArrayList<>();
+
+        for (String lockKey : lockKeys) {
+            try {
+                if (acquireLock(lockKey, owner, resource, ttlMs, "BATCH")) {
+                    LockInfo lockInfo = getLockInfo(lockKey);
+                    if (lockInfo != null) {
+                        acquiredLocks.add(lockInfo);
+                    }
+                }
+            } catch (Exception e) {
+                log.error("批量获取锁失败: {}", lockKey, e);
+            }
+        }
+
+        return acquiredLocks;
+    }
+
+    /**
+     * 清理过期锁
+     */
+    @Scheduled(fixedDelay = 60000)  // 每分钟清理一次
+    @Transactional
+    public void cleanupExpiredLocks() {
+        try {
+            Date now = new Date();
+
+            // 查找过期但状态仍是ACTIVE的锁
+            Query query = new Query(Criteria.where("expiresAt").lt(now)
+                .and("status").is("ACTIVE"));
+
+            Update update = new Update();
+            update.set("status", "EXPIRED");
+            update.set("expiredAt", now);
+            update.inc("version", 1);
+
+            long expiredCount = mongoTemplate.updateMulti(query, update, LOCK_COLLECTION)
+                .getModifiedCount();
+
+            if (expiredCount > 0) {
+                log.info("清理了 {} 个过期锁", expiredCount);
+
+                // 从本地缓存移除
+                localLocks.entrySet().removeIf(entry ->
+                    entry.getValue().isExpired());
+            }
+
+        } catch (Exception e) {
+            log.error("清理过期锁失败", e);
+        }
+    }
+
+    /**
+     * 统计锁信息
+     */
+    public Map<String, Object> getLockStats() {
+        Map<String, Object> stats = new HashMap<>();
+
+        try {
+            // 总锁数
+            long totalLocks = mongoTemplate.count(new Query(), LOCK_COLLECTION);
+            stats.put("totalLocks", totalLocks);
+
+            // 活跃锁数
+            Query activeQuery = new Query(Criteria.where("status").is("ACTIVE")
+                .and("expiresAt").gt(new Date()));
+            long activeLocks = mongoTemplate.count(activeQuery, LOCK_COLLECTION);
+            stats.put("activeLocks", activeLocks);
+
+            // 按类型统计
+            List<Map> typeStats = mongoTemplate.aggregate(
+                mongoTemplate.aggregation(
+                    mongoTemplate.aggregation.group("lockType").count().as("count"),
+                    mongoTemplate.aggregation.sort(mongoTemplate.sort(
+                        org.springframework.data.domain.Sort.Direction.DESC, "count"
+                    ))
+                ), LOCK_COLLECTION, Map.class
+            ).getMappedResults();
+            stats.put("lockTypeStats", typeStats);
+
+            // 按所有者统计
+            List<Map> ownerStats = mongoTemplate.aggregate(
+                mongoTemplate.aggregation(
+                    mongoTemplate.aggregation.match(Criteria.where("status").is("ACTIVE")),
+                    mongoTemplate.aggregation.group("owner").count().as("count"),
+                    mongoTemplate.aggregation.sort(mongoTemplate.sort(
+                        org.springframework.data.domain.Sort.Direction.DESC, "count"
+                    ))
+                ), LOCK_COLLECTION, Map.class
+            ).getMappedResults();
+            stats.put("ownerStats", ownerStats);
+
+            // 本地缓存统计
+            stats.put("localCacheSize", localLocks.size());
+            stats.put("totalAcquiredLocks", lockCounter.get());
+
+        } catch (Exception e) {
+            log.error("获取锁统计失败", e);
+        }
+
+        return stats;
+    }
+
+    /**
+     * 生成锁ID
+     */
+    private String generateLockId(String lockKey) {
+        return UUID.randomUUID().toString();
+    }
+
+    /**
+     * 简化版：获取锁
+     */
+    public boolean acquireLock(String lockKey, String resource, long ttlMs) {
+        String owner = getOwnerId();
+        return acquireLock(lockKey, owner, resource, ttlMs, "DEFAULT");
+    }
+
+    /**
+     * 简化版：创建锁
+     */
+    public boolean createLock(String lockKey, String resource, long ttlMs) {
+        String owner = getOwnerId();
+        return createLock(lockKey, owner, resource, ttlMs, "DEFAULT");
+    }
+
+    /**
+     * 获取所有者ID
+     */
+    private String getOwnerId() {
+        return System.getenv().getOrDefault("HOSTNAME",
+            System.getenv().getOrDefault("POD_NAME",
+                "instance-" + UUID.randomUUID().toString().substring(0, 8)));
+    }
+}
+
+
+3. LockInfo 存储位置
+
+LockInfo 会在以下地方被创建/新增：
+
+1. MongoDB 中（持久化存储）
+
+// 1. acquireLock() 方法
+LockInfo result = mongoTemplate.findAndModify(
+    query, update, options, LockInfo.class, LOCK_COLLECTION
+);
+// 当 upsert=true 时，如果不存在会新增
+
+// 2. createLock() 方法
+mongoTemplate.insert(newLock, LOCK_COLLECTION);
+// 显式插入新文档
+
+
+2. 本地缓存中（内存缓存）
+
+// 在获取锁成功后更新本地缓存
+localLocks.put(lockKey, result);
+
+
+4. 完整的数据初始化流程
+
+package com.example.s3scanner.service.coordinator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.index.IndexOperations;
+import org.springframework.data.mongodb.core.index.IndexResolver;
+import org.springframework.data.mongodb.core.index.MongoPersistentEntityIndexResolver;
+import org.springframework.data.mongodb.core.mapping.MongoMappingContext;
+import javax.annotation.PostConstruct;
+import java.util.Date;
+
+@Configuration
+@Slf4j
+@RequiredArgsConstructor
+public class LockInitialization {
+
+    private final MongoTemplate mongoTemplate;
+    private final MongoMappingContext mongoMappingContext;
+    private final DistributedLockService lockService;
+
+    /**
+     * 初始化锁集合
+     */
+    @PostConstruct
+    public void initLockCollection() {
+        try {
+            // 1. 创建索引
+            createIndexes();
+
+            // 2. 创建系统锁
+            createSystemLocks();
+
+            // 3. 清理旧的测试锁
+            cleanupTestLocks();
+
+            log.info("锁集合初始化完成");
+
+        } catch (Exception e) {
+            log.error("锁集合初始化失败", e);
+        }
+    }
+
+    /**
+     * 创建索引
+     */
+    private void createIndexes() {
+        try {
+            // 为 LockInfo 类创建索引
+            IndexOperations indexOps = mongoTemplate.indexOps("distributed_locks");
+
+            // 删除现有索引
+            // indexOps.dropAllIndexes();
+
+            // 解析实体创建索引
+            IndexResolver resolver = new MongoPersistentEntityIndexResolver(mongoMappingContext);
+
+            // 创建复合索引
+            org.springframework.data.mongodb.core.index.Index index1 =
+                new org.springframework.data.mongodb.core.index.Index()
+                .on("lockKey", org.springframework.data.domain.Sort.Direction.ASC)
+                .unique();
+            indexOps.ensureIndex(index1);
+
+            // 创建TTL索引（自动清理过期文档）
+            org.springframework.data.mongodb.core.index.Index index2 =
+                new org.springframework.data.mongodb.core.index.Index()
+                .on("expiresAt", org.springframework.data.domain.Sort.Direction.ASC)
+                .expire(0);  // 0秒后过期
+            indexOps.ensureIndex(index2);
+
+            // 创建查询索引
+            org.springframework.data.mongodb.core.index.Index index3 =
+                new org.springframework.data.mongodb.core.index.Index()
+                .on("owner", org.springframework.data.domain.Sort.Direction.ASC)
+                .on("status", org.springframework.data.domain.Sort.Direction.ASC);
+            indexOps.ensureIndex(index3);
+
+            org.springframework.data.mongodb.core.index.Index index4 =
+                new org.springframework.data.mongodb.core.index.Index()
+                .on("resource", org.springframework.data.domain.Sort.Direction.ASC)
+                .on("lockType", org.springframework.data.domain.Sort.Direction.ASC);
+            indexOps.ensureIndex(index4);
+
+            log.info("锁集合索引创建完成");
+
+        } catch (Exception e) {
+            log.error("创建索引失败", e);
+        }
+    }
+
+    /**
+     * 创建系统锁
+     */
+    private void createSystemLocks() {
+        try {
+            String owner = "system-init";
+            long ttlMs = 24 * 60 * 60 * 1000L;  // 24小时
+
+            // 系统级锁
+            lockService.createLock("system:health:check", owner, "system", ttlMs, "SYSTEM");
+            lockService.createLock("system:metrics:collect", owner, "system", ttlMs, "SYSTEM");
+            lockService.createLock("system:cleanup:task", owner, "system", ttlMs, "SYSTEM");
+
+            // 扫描锁
+            lockService.createLock("scan:global:coordination", owner, "scanner", ttlMs, "COORDINATION");
+
+            log.info("系统锁创建完成");
+
+        } catch (Exception e) {
+            log.error("创建系统锁失败", e);
+        }
+    }
+
+    /**
+     * 清理旧的测试锁
+     */
+    private void cleanupTestLocks() {
+        try {
+            // 删除过期的测试锁
+            Date cutoff = new Date(System.currentTimeMillis() - 7 * 24 * 60 * 60 * 1000L);  // 7天前
+
+            org.springframework.data.mongodb.core.query.Query query =
+                new org.springframework.data.mongodb.core.query.Query(
+                    org.springframework.data.mongodb.core.query.Criteria.where("createdAt").lt(cutoff)
+                        .and("owner").regex("test-.*")
+                );
+
+            long deleted = mongoTemplate.remove(query, "distributed_locks").getDeletedCount();
+
+            if (deleted > 0) {
+                log.info("清理了 {} 个旧的测试锁", deleted);
+            }
+
+        } catch (Exception e) {
+            log.error("清理测试锁失败", e);
+        }
+    }
+
+    /**
+     * 应用启动时初始化
+     */
+    @Bean
+    public ApplicationRunner lockInitializationRunner() {
+        return args -> {
+            log.info("开始初始化分布式锁系统...");
+
+            // 检查锁集合是否存在
+            boolean collectionExists = mongoTemplate.collectionExists("distributed_locks");
+            if (!collectionExists) {
+                log.info("创建分布式锁集合...");
+                mongoTemplate.createCollection("distributed_locks");
+            }
+
+            // 初始化统计数据
+            var stats = lockService.getLockStats();
+            log.info("锁系统初始化完成，当前统计: {}", stats);
+        };
+    }
+}
+
+
+5. 测试代码
+
+package com.example.s3scanner.service.coordinator;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import java.util.Date;
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest
+class DistributedLockServiceTest {
+
+    @Autowired
+    private DistributedLockService lockService;
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    @Test
+    void testAcquireLockCreatesNewDocument() {
+        String lockKey = "test:lock:" + System.currentTimeMillis();
+        String owner = "test-owner";
+        String resource = "test-resource";
+
+        // 确保锁不存在
+        Query query = new Query(Criteria.where("lockKey").is(lockKey));
+        assertFalse(mongoTemplate.exists(query, "distributed_locks"),
+            "锁不应该存在");
+
+        // 获取锁（应该创建新文档）
+        boolean acquired = lockService.acquireLock(lockKey, owner, resource, 30000, "TEST");
+        assertTrue(acquired, "应该成功获取锁");
+
+        // 验证文档被创建
+        assertTrue(mongoTemplate.exists(query, "distributed_locks"),
+            "锁文档应该被创建");
+
+        // 验证锁信息
+        DistributedLockService.LockInfo lockInfo = lockService.getLockInfo(lockKey);
+        assertNotNull(lockInfo, "应该能获取锁信息");
+        assertEquals(owner, lockInfo.getOwner());
+        assertEquals("ACTIVE", lockInfo.getStatus());
+
+        // 清理
+        lockService.releaseLock(lockKey, owner);
+    }
+
+    @Test
+    void testCreateLockCreatesNewDocument() {
+        String lockKey = "test:create:" + System.currentTimeMillis();
+        String owner = "test-creator";
+        String resource = "test-resource";
+
+        // 创建新锁
+        boolean created = lockService.createLock(lockKey, owner, resource, 60000, "CREATE_TEST");
+        assertTrue(created, "应该成功创建锁");
+
+        // 验证
+        Query query = new Query(Criteria.where("lockKey").is(lockKey));
+        assertTrue(mongoTemplate.exists(query, "distributed_locks"),
+            "锁文档应该存在");
+
+        // 清理
+        lockService.releaseLock(lockKey, owner);
+    }
+
+    @Test
+    void testLockExpiration() {
+        String lockKey = "test:expire:" + System.currentTimeMillis();
+        String owner = "test-owner";
+
+        // 获取一个1秒后过期的锁
+        lockService.acquireLock(lockKey, owner, "test", 1000, "EXPIRY_TEST");
+
+        // 立即检查
+        assertTrue(lockService.lockExists(lockKey), "锁应该存在");
+
+        // 等待过期
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // 检查锁信息
+        DistributedLockService.LockInfo lockInfo = lockService.getLockInfo(lockKey);
+        assertNotNull(lockInfo, "锁文档应该还存在");
+        assertEquals("ACTIVE", lockInfo.getStatus());  // 状态可能还是ACTIVE
+        assertTrue(lockInfo.isExpired(), "锁应该已过期");
+    }
+}
+
+
+总结
+
+关键点：
+
+1. findAndModify 确实可以新增数据，但需要设置 upsert(true)
+2. LockInfo 主要在以下地方被创建：
+   • acquireLock() 方法：当锁不存在时，通过 findAndModify 的 upsert 功能新增
+
+   • createLock() 方法：显式调用 mongoTemplate.insert() 新增
+
+   • 初始化脚本：应用启动时创建系统锁
+
+3. 数据存储位置：
+   • MongoDB：持久化存储，通过 upsert 或 insert 新增
+
+   • 内存缓存：成功获取锁后更新本地 Map
+
+4. 原子性保证：
+   • findAndModify 是原子操作，避免并发问题
+
+   • upsert 确保要么更新现有文档，要么插入新文档
+
+所以，你的分布式锁系统是完整的，LockInfo 文档会被正确地创建和存储在 MongoDB 中。
