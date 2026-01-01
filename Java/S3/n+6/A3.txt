@@ -1,0 +1,1752 @@
+为什么应用每次启动/重启都会往 instance_registry 新增一条记录，这个是否合理？
+# 应用启动时新增 InstanceRegistry 记录的合理性分析
+
+这是一个需要仔细考虑的设计问题。让我详细分析各种方案的优缺点。
+
+1. 现状分析
+1.1 当前行为
+java
+下载
+复制
+// 每次应用启动都会新增记录
+@PostConstruct
+public void init() {
+    registerInstance();  // 每次启动都新增
+    startHeartbeat();
+    updateConsistentHashRing();
+}
+
+private void registerInstance() {
+    InstanceInfo instance = InstanceInfo.builder()
+        .instanceId(instanceId)  // 新的实例ID
+        .hostname(getHostname())
+        .ipAddress(getIpAddress())
+        .status(InstanceInfo.InstanceStatus.STARTING)
+        .startedAt(new Date())
+        .concurrencyLimit(concurrencyLimit)
+        .currentLoad(0)
+        .build();
+
+    instanceRepository.save(instance);  // 新增记录
+}
+2. 三种策略对比
+2.1 策略1：每次启动新增（当前方案）
+java
+下载
+复制
+// 优点：
+// 1. 简单直接
+// 2. 历史记录完整
+// 3. 便于统计和分析
+// 4. 避免复杂的状态同步
+
+// 缺点：
+// 1. 记录会无限增长
+// 2. 需要定期清理
+// 3. 重启后实例ID可能变化
+2.2 策略2：更新已有记录
+java
+下载
+复制
+// 优点：
+// 1. 记录数量可控
+// 2. 保持相同的实例ID
+// 3. 重启历史可追踪
+
+// 缺点：
+// 1. 需要识别"相同实例"
+// 2. 状态管理复杂
+// 3. 并发重启问题
+2.3 策略3：混合方案
+java
+下载
+复制
+// 优点：
+// 1. 平衡记录数量和历史
+// 2. 灵活适应不同场景
+// 3. 可配置
+
+// 缺点：
+// 1. 实现较复杂
+// 2. 需要更多逻辑
+3. 详细实现方案
+3.1 方案1：智能注册（推荐）
+java
+下载
+复制
+package com.example.s3scanner.service.coordinator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import javax.annotation.PostConstruct;
+import java.net.InetAddress;
+import java.util.Date;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class SmartInstanceRegistry {
+
+    private final MongoTemplate mongoTemplate;
+
+    @Value("${app.instance.id}")
+    private String instanceId;
+
+    @Value("${app.instance.registration-strategy:UPDATE_IF_EXISTS}")
+    private RegistrationStrategy registrationStrategy;
+
+    @Value("${app.instance.max-history-per-instance:10}")
+    private int maxHistoryPerInstance;
+
+    private InstanceInfo currentInstance;
+
+    /**
+     * 注册策略枚举
+     */
+    public enum RegistrationStrategy {
+        ALWAYS_CREATE,      // 总是创建新记录
+        UPDATE_IF_EXISTS,   // 如果存在则更新
+        ALWAYS_UPDATE,      // 总是更新（智能识别）
+        HYBRID              // 混合策略
+    }
+
+    /**
+     * 智能实例注册
+     */
+    @PostConstruct
+    @Transactional
+    public void registerInstanceSmartly() {
+        switch (registrationStrategy) {
+            case ALWAYS_CREATE:
+                createNewInstance();
+                break;
+
+            case UPDATE_IF_EXISTS:
+                updateOrCreateInstance();
+                break;
+
+            case ALWAYS_UPDATE:
+                updateExistingInstance();
+                break;
+
+            case HYBRID:
+                hybridRegistration();
+                break;
+
+            default:
+                createNewInstance();
+        }
+
+        startHeartbeat();
+        log.info("实例注册完成: {}", currentInstance.getInstanceId());
+    }
+
+    /**
+     * 方案1：总是创建新记录
+     */
+    private void createNewInstance() {
+        InstanceInfo newInstance = buildInstanceInfo();
+        mongoTemplate.insert(newInstance, "instances");
+        currentInstance = newInstance;
+
+        log.info("创建新实例记录: {}", instanceId);
+    }
+
+    /**
+     * 方案2：如果存在则更新
+     */
+    private void updateOrCreateInstance() {
+        // 查找相同实例ID的记录
+        Optional<InstanceInfo> existing = findInstanceById(instanceId);
+
+        if (existing.isPresent()) {
+            // 更新现有记录
+            updateInstance(existing.get());
+            currentInstance = existing.get();
+            log.info("更新现有实例记录: {}", instanceId);
+        } else {
+            // 创建新记录
+            createNewInstance();
+        }
+    }
+
+    /**
+     * 方案3：智能更新（推荐）
+     */
+    private void updateExistingInstance() {
+        // 1. 首先尝试按ID查找
+        Optional<InstanceInfo> byId = findInstanceById(instanceId);
+        if (byId.isPresent()) {
+            updateInstance(byId.get());
+            currentInstance = byId.get();
+            log.info("按ID更新实例: {}", instanceId);
+            return;
+        }
+
+        // 2. 尝试按主机名+IP查找（同一台机器）
+        Optional<InstanceInfo> byHost = findInstanceByHost();
+        if (byHost.isPresent()) {
+            InstanceInfo existing = byHost.get();
+
+            // 检查是否在合理时间内重启
+            if (isRecentRestart(existing)) {
+                // 更新现有记录
+                updateInstance(existing);
+                currentInstance = existing;
+                log.info("按主机信息更新实例: {}", existing.getInstanceId());
+                return;
+            } else {
+                // 重启间隔太长，创建新记录
+                archiveInstance(existing);
+                createNewInstance();
+                return;
+            }
+        }
+
+        // 3. 创建新记录
+        createNewInstance();
+    }
+
+    /**
+     * 方案4：混合策略
+     */
+    private void hybridRegistration() {
+        // 生产环境：尽量复用
+        if (isProduction()) {
+            updateExistingInstance();
+        }
+        // 开发/测试环境：创建新记录
+        else if (isDevelopment()) {
+            createNewInstance();
+        }
+        // 其他环境
+        else {
+            updateOrCreateInstance();
+        }
+    }
+
+    /**
+     * 构建实例信息
+     */
+    private InstanceInfo buildInstanceInfo() {
+        return InstanceInfo.builder()
+            .instanceId(instanceId)
+            .hostname(getHostname())
+            .ipAddress(getIpAddress())
+            .status(InstanceInfo.InstanceStatus.STARTING)
+            .startedAt(new Date())
+            .lastHeartbeat(new Date())
+            .restartCount(0)
+            .version(1)
+            .metadata(buildMetadata())
+            .build();
+    }
+
+    /**
+     * 更新实例
+     */
+    private void updateInstance(InstanceInfo existing) {
+        Update update = new Update();
+        update.set("status", InstanceInfo.InstanceStatus.STARTING);
+        update.set("restartedAt", new Date());
+        update.inc("restartCount", 1);
+        update.inc("version", 1);
+        update.set("lastHeartbeat", new Date());
+        update.set("expiresAt", new Date(System.currentTimeMillis() + 90000));
+
+        // 保留历史
+        archiveIfNeeded(existing);
+
+        Query query = new Query(Criteria.where("_id").is(existing.getId()));
+        mongoTemplate.updateFirst(query, update, InstanceInfo.class, "instances");
+
+        // 重新加载
+        currentInstance = findInstanceById(existing.getInstanceId())
+            .orElseThrow(() -> new RuntimeException("更新后实例不存在"));
+    }
+
+    /**
+     * 归档旧记录
+     */
+    private void archiveInstance(InstanceInfo instance) {
+        InstanceArchive archive = InstanceArchive.builder()
+            .originalId(instance.getId())
+            .instanceId(instance.getInstanceId())
+            .hostname(instance.getHostname())
+            .ipAddress(instance.getIpAddress())
+            .startedAt(instance.getStartedAt())
+            .endedAt(new Date())
+            .totalUptime(System.currentTimeMillis() - instance.getStartedAt().getTime())
+            .restartCount(instance.getRestartCount())
+            .finalStatus(instance.getStatus())
+            .build();
+
+        mongoTemplate.insert(archive, "instance_archive");
+        mongoTemplate.remove(instance, "instances");
+
+        log.info("归档实例记录: {}", instance.getInstanceId());
+    }
+
+    /**
+     * 检查是否需要归档
+     */
+    private void archiveIfNeeded(InstanceInfo instance) {
+        // 如果重启次数太多，归档并新建
+        if (instance.getRestartCount() >= maxHistoryPerInstance) {
+            archiveInstance(instance);
+            createNewInstance();
+        }
+    }
+
+    /**
+     * 检查是否最近重启
+     */
+    private boolean isRecentRestart(InstanceInfo instance) {
+        Date lastSeen = instance.getLastHeartbeat();
+        if (lastSeen == null) {
+            return false;
+        }
+
+        long timeSinceLastSeen = System.currentTimeMillis() - lastSeen.getTime();
+        // 5分钟内认为是重启
+        return timeSinceLastSeen < 5 * 60 * 1000;
+    }
+}
+4. 完整的智能注册服务
+4.1 主注册服务
+java
+下载
+复制
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class InstanceRegistrationService {
+
+    private final MongoTemplate mongoTemplate;
+    private final InstanceIdentityManager identityManager;
+
+    @Value("${app.instance.registration.enabled:true}")
+    private boolean registrationEnabled;
+
+    @Value("${app.instance.registration.mode:INTELLIGENT}")
+    private RegistrationMode registrationMode;
+
+    @Value("${app.instance.ttl.minutes:5}")
+    private int instanceTtlMinutes;
+
+    /**
+     * 注册模式
+     */
+    public enum RegistrationMode {
+        CREATE_NEW,      // 总是创建新记录
+        REUSE_EXISTING,  // 重用现有记录
+        INTELLIGENT,     // 智能选择
+        ARCHIVE_BASED    // 基于归档
+    }
+
+    /**
+     * 注册实例
+     */
+    @PostConstruct
+    @Transactional
+    public void register() {
+        if (!registrationEnabled) {
+            log.info("实例注册已禁用");
+            return;
+        }
+
+        String instanceId = identityManager.getInstanceId();
+
+        try {
+            switch (registrationMode) {
+                case CREATE_NEW:
+                    createNewRegistration(instanceId);
+                    break;
+
+                case REUSE_EXISTING:
+                    reuseExistingRegistration(instanceId);
+                    break;
+
+                case INTELLIGENT:
+                    intelligentRegistration(instanceId);
+                    break;
+
+                case ARCHIVE_BASED:
+                    archiveBasedRegistration(instanceId);
+                    break;
+            }
+
+            log.info("实例注册成功: 模式={}, ID={}",
+                registrationMode, instanceId);
+
+        } catch (Exception e) {
+            log.error("实例注册失败", e);
+
+            // 紧急回退：创建新记录
+            createNewRegistration(instanceId);
+        }
+    }
+
+    /**
+     * 创建新注册
+     */
+    private void createNewRegistration(String instanceId) {
+        InstanceRecord record = buildInstanceRecord(instanceId);
+        mongoTemplate.insert(record, "instances");
+
+        log.info("创建新实例记录: {}", instanceId);
+    }
+
+    /**
+     * 重用现有注册
+     */
+    private void reuseExistingRegistration(String instanceId) {
+        // 查找活跃记录
+        Optional<InstanceRecord> existing = findActiveInstance(instanceId);
+
+        if (existing.isPresent()) {
+            // 更新现有记录
+            updateInstanceRecord(existing.get());
+            log.info("重用现有实例记录: {}", instanceId);
+        } else {
+            // 创建新记录
+            createNewRegistration(instanceId);
+        }
+    }
+
+    /**
+     * 智能注册
+     */
+    private void intelligentRegistration(String instanceId) {
+        // 1. 检查是否在K8s中
+        if (isRunningInKubernetes()) {
+            handleKubernetesRegistration(instanceId);
+            return;
+        }
+
+        // 2. 检查是否在Docker中
+        if (isRunningInDocker()) {
+            handleDockerRegistration(instanceId);
+            return;
+        }
+
+        // 3. 物理机/虚拟机
+        handleTraditionalRegistration(instanceId);
+    }
+
+    /**
+     * 处理Kubernetes注册
+     */
+    private void handleKubernetesRegistration(String instanceId) {
+        String podName = System.getenv("POD_NAME");
+
+        if (podName != null && podName.equals(instanceId)) {
+            // Pod名称不变，更新现有记录
+            Optional<InstanceRecord> existing = findInstanceByPodName(podName);
+
+            if (existing.isPresent()) {
+                // 检查Pod是否重启
+                if (isPodRestart(existing.get())) {
+                    updateInstanceRecord(existing.get());
+                    log.info("K8s Pod重启，更新记录: {}", podName);
+                } else {
+                    // 可能是新Pod，创建记录
+                    createNewRegistration(instanceId);
+                }
+            } else {
+                createNewRegistration(instanceId);
+            }
+        } else {
+            createNewRegistration(instanceId);
+        }
+    }
+
+    /**
+     * 处理Docker注册
+     */
+    private void handleDockerRegistration(String instanceId) {
+        String containerId = getContainerId();
+
+        if (containerId != null) {
+            Optional<InstanceRecord> existing = findInstanceByContainerId(containerId);
+
+            if (existing.isPresent()) {
+                // 相同容器，更新
+                updateInstanceRecord(existing.get());
+            } else {
+                // 新容器，创建
+                createNewRegistration(instanceId);
+            }
+        } else {
+            createNewRegistration(instanceId);
+        }
+    }
+
+    /**
+     * 处理传统注册
+     */
+    private void handleTraditionalRegistration(String instanceId) {
+        String hostname = getHostname();
+        String ipAddress = getIpAddress();
+
+        // 查找相同主机的活跃实例
+        Optional<InstanceRecord> existing = findInstanceByHost(hostname, ipAddress);
+
+        if (existing.isPresent()) {
+            InstanceRecord record = existing.get();
+
+            // 检查重启时间
+            if (isRecentRestart(record)) {
+                // 短时间内重启，更新
+                updateInstanceRecord(record);
+            } else {
+                // 长时间后重启，归档旧记录，创建新记录
+                archiveInstance(record);
+                createNewRegistration(instanceId);
+            }
+        } else {
+            createNewRegistration(instanceId);
+        }
+    }
+
+    /**
+     * 构建实例记录
+     */
+    private InstanceRecord buildInstanceRecord(String instanceId) {
+        Date now = new Date();
+        Date expiresAt = new Date(now.getTime() + instanceTtlMinutes * 60 * 1000L);
+
+        return InstanceRecord.builder()
+            .id(UUID.randomUUID().toString())
+            .instanceId(instanceId)
+            .registrationId(generateRegistrationId())
+            .hostname(getHostname())
+            .ipAddress(getIpAddress())
+            .podName(System.getenv("POD_NAME"))
+            .containerId(getContainerId())
+            .status(InstanceStatus.REGISTERED)
+            .registeredAt(now)
+            .lastHeartbeat(now)
+            .expiresAt(expiresAt)
+            .restartCount(0)
+            .version(1)
+            .metadata(buildMetadata())
+            .build();
+    }
+
+    /**
+     * 更新实例记录
+     */
+    private void updateInstanceRecord(InstanceRecord record) {
+        Date now = new Date();
+        Date expiresAt = new Date(now.getTime() + instanceTtlMinutes * 60 * 1000L);
+
+        Update update = new Update();
+        update.set("lastHeartbeat", now);
+        update.set("expiresAt", expiresAt);
+        update.set("status", InstanceStatus.ACTIVE);
+        update.inc("restartCount", 1);
+        update.inc("version", 1);
+        update.set("restartedAt", now);
+
+        Query query = new Query(Criteria.where("_id").is(record.getId()));
+        mongoTemplate.updateFirst(query, update, InstanceRecord.class, "instances");
+    }
+}
+5. 配置建议
+5.1 不同环境的配置
+yaml
+复制
+# application-k8s.yml (Kubernetes)
+app:
+  instance:
+    registration:
+      enabled: true
+      mode: INTELLIGENT
+      strategy: UPDATE_EXISTING
+      ttl:
+        minutes: 5
+    id: ${POD_NAME}  # 使用Pod名称，重启时不变
+
+# application-docker.yml (Docker)
+app:
+  instance:
+    registration:
+      enabled: true
+      mode: INTELLIGENT
+      strategy: UPDATE_EXISTING
+      ttl:
+        minutes: 10
+    id: ${HOSTNAME}  # 容器ID，重启时变化
+
+# application-local.yml (本地开发)
+app:
+  instance:
+    registration:
+      enabled: true
+      mode: CREATE_NEW  # 开发环境总是创建新记录
+      strategy: ALWAYS_CREATE
+      ttl:
+        minutes: 60
+    id: ${HOSTNAME}-${random.uuid}  # 包含随机数
+
+# application-prod.yml (生产环境-物理机)
+app:
+  instance:
+    registration:
+      enabled: true
+      mode: INTELLIGENT
+      strategy: REUSE_IF_RECENT
+      reuse-window-ms: 300000  # 5分钟内重启视为同一实例
+      ttl:
+        minutes: 5
+    id: ${HOSTNAME}-${app.version}  # 主机名+版本
+6. 清理策略
+6.1 自动清理服务
+java
+下载
+复制
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class InstanceCleanupService {
+
+    private final MongoTemplate mongoTemplate;
+
+    @Value("${app.instance.cleanup.enabled:true}")
+    private boolean cleanupEnabled;
+
+    @Value("${app.instance.cleanup.expired-hours:72}")
+    private int expiredHours;
+
+    @Value("${app.instance.cleanup.max-records:1000}")
+    private int maxRecords;
+
+    /**
+     * 清理过期实例
+     */
+    @Scheduled(fixedDelay = 3600000)  // 每小时
+    @Transactional
+    public void cleanupExpiredInstances() {
+        if (!cleanupEnabled) {
+            return;
+        }
+
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - expiredHours * 3600000L);
+
+            // 1. 清理过期记录
+            Query expiredQuery = new Query(Criteria.where("expiresAt").lt(new Date()));
+            long expiredDeleted = mongoTemplate.remove(
+                expiredQuery, InstanceRecord.class, "instances"
+            ).getDeletedCount();
+
+            // 2. 归档旧记录
+            archiveOldRecords();
+
+            // 3. 清理归档
+            cleanupArchive();
+
+            if (expiredDeleted > 0) {
+                log.info("清理了 {} 个过期实例记录", expiredDeleted);
+            }
+
+        } catch (Exception e) {
+            log.error("清理实例记录失败", e);
+        }
+    }
+
+    /**
+     * 归档旧记录
+     */
+    private void archiveOldRecords() {
+        // 获取实例数量
+        long totalCount = mongoTemplate.count(new Query(), "instances");
+
+        if (totalCount <= maxRecords) {
+            return;
+        }
+
+        // 需要归档的数量
+        long toArchive = totalCount - maxRecords;
+
+        // 找到最旧的记录
+        Query oldQuery = new Query()
+            .with(Sort.by(Sort.Order.asc("registeredAt")))
+            .limit((int) toArchive);
+
+        List<InstanceRecord> oldRecords = mongoTemplate.find(
+            oldQuery, InstanceRecord.class, "instances"
+        );
+
+        // 归档
+        for (InstanceRecord record : oldRecords) {
+            archiveToHistory(record);
+            mongoTemplate.remove(record, "instances");
+        }
+
+        log.info("归档了 {} 个旧实例记录", oldRecords.size());
+    }
+}
+7. 监控和告警
+7.1 注册监控
+java
+下载
+复制
+@Component
+@Slf4j
+public class RegistrationMonitor {
+
+    @Scheduled(fixedDelay = 300000)  // 5分钟
+    public void monitorRegistrationPatterns() {
+        try {
+            // 检查频繁重启
+            List<FrequentRestart> frequent = detectFrequentRestarts();
+
+            for (FrequentRestart restart : frequent) {
+                sendAlert("FrequentInstanceRestart",
+                    String.format("实例 %s 频繁重启: %d 次/小时",
+                        restart.getInstanceId(), restart.getRestartsPerHour()));
+            }
+
+            // 检查记录增长
+            long totalRecords = getTotalInstanceRecords();
+            long activeRecords = getActiveInstanceCount();
+
+            if (totalRecords > 10000) {
+                sendAlert("HighInstanceRecordCount",
+                    String.format("实例记录过多: 总计 %d, 活跃 %d",
+                        totalRecords, activeRecords));
+            }
+
+        } catch (Exception e) {
+            log.error("监控注册模式失败", e);
+        }
+    }
+}
+8. 最佳实践总结
+8.1 推荐策略
+java
+下载
+复制
+// 综合推荐：智能注册 + 有限历史
+public class RegistrationBestPractice {
+
+    /**
+     * 生产环境推荐配置
+     */
+    public RegistrationConfig getProductionConfig() {
+        return RegistrationConfig.builder()
+            .mode(RegistrationMode.INTELLIGENT)
+            .reuseExisting(true)
+            .reuseWindowMs(300000)     // 5分钟
+            .maxHistoryPerInstance(10)  // 每个实例最多10条历史
+            .cleanupExpiredHours(72)    // 3天后清理
+            .archiveOldRecords(true)
+            .build();
+    }
+
+    /**
+     * 开发环境推荐配置
+     */
+    public RegistrationConfig getDevelopmentConfig() {
+        return RegistrationConfig.builder()
+            .mode(RegistrationMode.CREATE_NEW)  // 开发环境总是新建
+            .cleanupExpiredHours(24)            // 1天后清理
+            .maxTotalRecords(1000)              // 最多1000条记录
+            .build();
+    }
+}
+8.2 在你的S3扫描系统中
+yaml
+复制
+# 推荐配置
+app:
+  instance:
+    # 实例ID生成策略
+    id-generation:
+      strategy: ENVIRONMENT_AWARE
+      k8s-use-pod-name: true
+      docker-use-container-id: true
+      fallback: HOSTNAME_TIMESTAMP
+
+    # 注册策略
+    registration:
+      enabled: true
+      strategy: INTELLIGENT_UPDATE
+
+      # 智能更新规则
+      update-rules:
+        - condition: "isKubernetesPod() && samePodName()"
+          action: UPDATE_EXISTING
+        - condition: "isDockerContainer() && sameContainerId()"
+          action: UPDATE_EXISTING
+        - condition: "sameHost() && restartWithin(5min)"
+          action: UPDATE_EXISTING
+        - condition: "default"
+          action: CREATE_NEW
+
+      # 清理策略
+      cleanup:
+        enabled: true
+        # 活跃实例：心跳超时5分钟后清理
+        active-ttl-minutes: 5
+        # 历史记录：保留7天
+        history-retention-days: 7
+        # 最大总记录数
+        max-total-records: 10000
+9. 结论
+
+每次启动都新增记录是否合理？
+
+答案：取决于具体场景，但有更好的方案。
+
+应该新增记录的情况：
+
+开发/测试环境：便于调试和跟踪
+
+实例ID每次变化时：容器重启后ID变化
+
+需要完整审计日志时：合规性要求
+
+应该更新记录的情况：
+
+生产环境K8s：Pod名称不变
+
+需要控制记录数量时：防止数据库膨胀
+
+状态追踪重要时：保持实例历史连续性
+
+推荐方案：智能注册
+java
+下载
+复制
+// 伪代码
+if (isKubernetesPod && podName不变) {
+    更新现有记录();
+} else if (isDockerContainer && containerId不变) {
+    更新现有记录();
+} else if (sameHost && 近期重启) {
+    更新现有记录();
+} else {
+    创建新记录();
+}
+
+在你的S3扫描系统中，建议：
+
+K8s生产环境：更新现有记录（Pod名称稳定）
+
+开发环境：创建新记录（便于调试）
+
+实现智能判断：根据环境自动选择策略
+
+定期清理：防止数据无限增长
+
+这样可以平衡可追溯性和系统性能。
+
+似乎activeInstances 永远只会有一条记录（当前应用的记录）
+是的，你观察得很准确！让我分析这个问题。
+1. 问题分析
+1.1 当前代码的问题
+java
+下载
+复制
+// InstanceRegistry.java
+@PostConstruct
+public void init() {
+    registerInstance();  // 只注册自己
+    startHeartbeat();    // 只更新自己
+    updateConsistentHashRing();
+}
+
+// 问题：
+// 1. 每个实例只注册自己
+// 2. 没有获取其他实例的信息
+// 3. activeInstances 只包含自己
+// 4. 无法实现真正的分布式协调
+1.2 期望的行为
+java
+下载
+复制
+// 期望：activeInstances 应该包含
+[
+    {
+        "instanceId": "s3-scanner-pod-1",
+        "hostname": "pod-1",
+        "status": "RUNNING",
+        "lastHeartbeat": "2024-01-15T10:00:00Z"
+    },
+    {
+        "instanceId": "s3-scanner-pod-2",
+        "hostname": "pod-2",
+        "status": "RUNNING",
+        "lastHeartbeat": "2024-01-15T10:00:10Z"
+    },
+    {
+        "instanceId": "s3-scanner-pod-3",
+        "hostname": "pod-3",
+        "status": "RUNNING",
+        "lastHeartbeat": "2024-01-15T10:00:20Z"
+    }
+]
+2. 正确的分布式协调架构
+2.1 完整的实例协调器
+java
+下载
+复制
+package com.example.s3scanner.service.coordinator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import javax.annotation.PostConstruct;
+import java.net.InetAddress;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedInstanceRegistry {
+
+    private final MongoTemplate mongoTemplate;
+    private static final String INSTANCE_COLLECTION = "distributed_instances";
+
+    // 当前实例ID
+    @Value("${app.instance.id}")
+    private String instanceId;
+
+    // 实例元数据
+    private InstanceInfo currentInstance;
+
+    // 活跃实例缓存（包含所有实例）
+    private final Map<String, InstanceInfo> activeInstances = new ConcurrentHashMap<>();
+
+    // 配置
+    @Value("${app.instance.heartbeat-interval:30}")
+    private int heartbeatInterval;
+
+    @Value("${app.instance.concurrency-limit:20}")
+    private int concurrencyLimit;
+
+    @Value("${app.instance.ttl-seconds:90}")
+    private int instanceTtlSeconds;
+
+    // 状态
+    private final AtomicInteger currentLoad = new AtomicInteger(0);
+
+    /**
+     * 初始化
+     */
+    @PostConstruct
+    public void init() {
+        // 1. 注册当前实例
+        registerCurrentInstance();
+
+        // 2. 启动心跳
+        startHeartbeat();
+
+        // 3. 加载其他实例
+        loadOtherInstances();
+
+        // 4. 更新一致性哈希环
+        updateConsistentHashRing();
+
+        log.info("分布式实例注册中心初始化完成，当前实例: {}", instanceId);
+    }
+
+    /**
+     * 注册当前实例
+     */
+    @Transactional
+    public void registerCurrentInstance() {
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + instanceTtlSeconds * 1000L);
+
+            // 构建实例信息
+            currentInstance = InstanceInfo.builder()
+                .instanceId(instanceId)
+                .hostname(getHostname())
+                .ipAddress(getIpAddress())
+                .status(InstanceInfo.InstanceStatus.STARTING)
+                .registeredAt(now)
+                .lastHeartbeat(now)
+                .expiresAt(expiresAt)
+                .concurrencyLimit(concurrencyLimit)
+                .currentLoad(0)
+                .capabilities(buildCapabilities())
+                .metadata(buildMetadata())
+                .version(1)
+                .build();
+
+            // 保存到数据库
+            mongoTemplate.save(currentInstance, INSTANCE_COLLECTION);
+
+            // 添加到本地缓存
+            activeInstances.put(instanceId, currentInstance);
+
+            log.info("当前实例注册成功: {}", instanceId);
+
+        } catch (Exception e) {
+            log.error("注册当前实例失败", e);
+            throw new RuntimeException("实例注册失败", e);
+        }
+    }
+
+    /**
+     * 加载其他实例
+     */
+    public void loadOtherInstances() {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - instanceTtlSeconds * 1000L);
+
+            // 查询所有活跃实例（排除自己）
+            Query query = new Query(Criteria.where("lastHeartbeat").gt(cutoff)
+                .and("status").is(InstanceInfo.InstanceStatus.RUNNING.name()));
+
+            List<InstanceInfo> instances = mongoTemplate.find(
+                query, InstanceInfo.class, INSTANCE_COLLECTION
+            );
+
+            // 过滤掉自己
+            List<InstanceInfo> otherInstances = instances.stream()
+                .filter(instance -> !instanceId.equals(instance.getInstanceId()))
+                .collect(Collectors.toList());
+
+            // 添加到缓存
+            for (InstanceInfo instance : otherInstances) {
+                activeInstances.put(instance.getInstanceId(), instance);
+            }
+
+            log.info("加载了 {} 个其他活跃实例: {}",
+                otherInstances.size(),
+                otherInstances.stream()
+                    .map(InstanceInfo::getInstanceId)
+                    .collect(Collectors.toList()));
+
+        } catch (Exception e) {
+            log.error("加载其他实例失败", e);
+        }
+    }
+
+    /**
+     * 启动心跳
+     */
+    private void startHeartbeat() {
+        Timer timer = new Timer("instance-heartbeat", true);
+
+        timer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                updateHeartbeat();
+                refreshOtherInstances();
+            }
+        }, 0, heartbeatInterval * 1000L);
+    }
+
+    /**
+     * 更新当前实例心跳
+     */
+    @Transactional
+    public void updateHeartbeat() {
+        try {
+            Date now = new Date();
+            Date expiresAt = new Date(now.getTime() + instanceTtlSeconds * 1000L);
+
+            Query query = new Query(Criteria.where("instanceId").is(instanceId));
+
+            Update update = new Update();
+            update.set("lastHeartbeat", now);
+            update.set("expiresAt", expiresAt);
+            update.set("status", InstanceInfo.InstanceStatus.RUNNING);
+            update.set("currentLoad", currentLoad.get());
+            update.inc("heartbeatCount", 1);
+            update.inc("version", 1);
+
+            mongoTemplate.updateFirst(query, update, InstanceInfo.class, INSTANCE_COLLECTION);
+
+            // 更新本地缓存
+            if (currentInstance != null) {
+                currentInstance.setLastHeartbeat(now);
+                currentInstance.setExpiresAt(expiresAt);
+                currentInstance.setStatus(InstanceInfo.InstanceStatus.RUNNING);
+                currentInstance.setCurrentLoad(currentLoad.get());
+                activeInstances.put(instanceId, currentInstance);
+            }
+
+        } catch (Exception e) {
+            log.error("更新心跳失败", e);
+        }
+    }
+
+    /**
+     * 刷新其他实例状态
+     */
+    @Scheduled(fixedDelay = 10000)  // 每10秒刷新一次
+    public void refreshOtherInstances() {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - instanceTtlSeconds * 1000L);
+
+            // 查询所有活跃实例
+            Query query = new Query(Criteria.where("lastHeartbeat").gt(cutoff)
+                .and("status").is(InstanceInfo.InstanceStatus.RUNNING.name()));
+
+            List<InstanceInfo> instances = mongoTemplate.find(
+                query, InstanceInfo.class, INSTANCE_COLLECTION
+            );
+
+            // 更新缓存
+            Map<String, InstanceInfo> newActiveInstances = new ConcurrentHashMap<>();
+
+            for (InstanceInfo instance : instances) {
+                newActiveInstances.put(instance.getInstanceId(), instance);
+
+                // 如果是新发现的实例
+                if (!activeInstances.containsKey(instance.getInstanceId())) {
+                    log.info("发现新实例: {} ({}:{})",
+                        instance.getInstanceId(),
+                        instance.getHostname(),
+                        instance.getIpAddress());
+                }
+            }
+
+            // 找出下线的实例
+            List<String> removedInstances = activeInstances.keySet().stream()
+                .filter(id -> !newActiveInstances.containsKey(id))
+                .collect(Collectors.toList());
+
+            for (String removedId : removedInstances) {
+                if (!removedId.equals(instanceId)) {  // 不删除自己
+                    log.warn("实例下线: {}", removedId);
+                }
+            }
+
+            // 更新缓存
+            activeInstances.clear();
+            activeInstances.putAll(newActiveInstances);
+
+        } catch (Exception e) {
+            log.error("刷新实例状态失败", e);
+        }
+    }
+
+    /**
+     * 清理过期实例
+     */
+    @Scheduled(fixedDelay = 60000)  // 每分钟清理一次
+    @Transactional
+    public void cleanupExpiredInstances() {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - instanceTtlSeconds * 1000L);
+
+            // 查找过期实例
+            Query query = new Query(Criteria.where("lastHeartbeat").lt(cutoff)
+                .orOperator(
+                    Criteria.where("status").is(InstanceInfo.InstanceStatus.RUNNING.name()),
+                    Criteria.where("status").is(InstanceInfo.InstanceStatus.STARTING.name())
+                ));
+
+            Update update = new Update();
+            update.set("status", InstanceInfo.InstanceStatus.EXPIRED);
+            update.set("expiredAt", new Date());
+            update.inc("version", 1);
+
+            long expired = mongoTemplate.updateMulti(
+                query, update, InstanceInfo.class, INSTANCE_COLLECTION
+            ).getModifiedCount();
+
+            if (expired > 0) {
+                log.info("标记了 {} 个过期实例", expired);
+
+                // 从缓存中移除
+                activeInstances.entrySet().removeIf(entry ->
+                    entry.getValue().getLastHeartbeat().before(cutoff) &&
+                    !entry.getKey().equals(instanceId)  // 不删除自己
+                );
+            }
+
+        } catch (Exception e) {
+            log.error("清理过期实例失败", e);
+        }
+    }
+
+    /**
+     * 获取所有活跃实例
+     */
+    public List<InstanceInfo> getActiveInstances() {
+        Date cutoff = new Date(System.currentTimeMillis() - instanceTtlSeconds * 1000L);
+
+        return activeInstances.values().stream()
+            .filter(instance ->
+                instance.getLastHeartbeat() != null &&
+                instance.getLastHeartbeat().after(cutoff) &&
+                instance.getStatus() == InstanceInfo.InstanceStatus.RUNNING
+            )
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * 获取其他实例（排除自己）
+     */
+    public List<InstanceInfo> getOtherInstances() {
+        return getActiveInstances().stream()
+            .filter(instance -> !instanceId.equals(instance.getInstanceId()))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * 检查实例是否活跃
+     */
+    public boolean isInstanceActive(String instanceId) {
+        InstanceInfo instance = activeInstances.get(instanceId);
+        if (instance == null) {
+            return false;
+        }
+
+        Date cutoff = new Date(System.currentTimeMillis() - instanceTtlSeconds * 1000L);
+        return instance.getLastHeartbeat() != null &&
+               instance.getLastHeartbeat().after(cutoff) &&
+               instance.getStatus() == InstanceInfo.InstanceStatus.RUNNING;
+    }
+
+    /**
+     * 获取集群统计
+     */
+    public Map<String, Object> getClusterStats() {
+        List<InstanceInfo> active = getActiveInstances();
+        List<InstanceInfo> others = getOtherInstances();
+
+        int totalLoad = active.stream()
+            .mapToInt(InstanceInfo::getCurrentLoad)
+            .sum();
+
+        int totalCapacity = active.stream()
+            .mapToInt(InstanceInfo::getConcurrencyLimit)
+            .sum();
+
+        double loadPercentage = totalCapacity > 0 ?
+            (double) totalLoad / totalCapacity * 100 : 0;
+
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("totalInstances", active.size());
+        stats.put("otherInstances", others.size());
+        stats.put("totalLoad", totalLoad);
+        stats.put("totalCapacity", totalCapacity);
+        stats.put("loadPercentage", String.format("%.1f%%", loadPercentage));
+        stats.put("currentInstanceId", instanceId);
+        stats.put("currentInstanceLoad", currentLoad.get());
+
+        // 实例详情
+        List<Map<String, Object>> instancesDetail = active.stream()
+            .map(instance -> {
+                Map<String, Object> detail = new HashMap<>();
+                detail.put("instanceId", instance.getInstanceId());
+                detail.put("hostname", instance.getHostname());
+                detail.put("status", instance.getStatus().name());
+                detail.put("load", instance.getCurrentLoad());
+                detail.put("limit", instance.getConcurrencyLimit());
+                detail.put("lastHeartbeat", instance.getLastHeartbeat());
+                detail.put("isCurrent", instanceId.equals(instance.getInstanceId()));
+                return detail;
+            })
+            .collect(Collectors.toList());
+
+        stats.put("instances", instancesDetail);
+
+        return stats;
+    }
+
+    // 其他辅助方法...
+    private String getHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    private String getIpAddress() {
+        try {
+            return InetAddress.getLocalHost().getHostAddress();
+        } catch (Exception e) {
+            return "127.0.0.1";
+        }
+    }
+
+    private Map<String, Object> buildCapabilities() {
+        Map<String, Object> caps = new HashMap<>();
+        caps.put("s3.scan", true);
+        caps.put("s3.process", true);
+        caps.put("distributed", true);
+        return caps;
+    }
+
+    private Map<String, Object> buildMetadata() {
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("startupTime", new Date());
+        meta.put("javaVersion", System.getProperty("java.version"));
+        return meta;
+    }
+}
+3. 完整的分布式协调系统
+3.1 服务发现和协调
+java
+下载
+复制
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class ServiceDiscoveryCoordinator {
+
+    private final DistributedInstanceRegistry instanceRegistry;
+    private final MongoTemplate mongoTemplate;
+
+    // 服务发现集合
+    private static final String SERVICE_DISCOVERY_COLLECTION = "service_discovery";
+
+    /**
+     * 注册服务
+     */
+    public void registerService(String serviceName, String serviceType,
+                               Map<String, Object> metadata) {
+        try {
+            String instanceId = instanceRegistry.getInstanceId();
+
+            ServiceRegistration registration = ServiceRegistration.builder()
+                .serviceId(generateServiceId(serviceName, instanceId))
+                .serviceName(serviceName)
+                .serviceType(serviceType)
+                .instanceId(instanceId)
+                .registeredAt(new Date())
+                .lastHeartbeat(new Date())
+                .metadata(metadata)
+                .status(ServiceStatus.ACTIVE)
+                .build();
+
+            mongoTemplate.save(registration, SERVICE_DISCOVERY_COLLECTION);
+
+            log.info("服务注册成功: {} ({})", serviceName, serviceType);
+
+        } catch (Exception e) {
+            log.error("服务注册失败: {}", serviceName, e);
+        }
+    }
+
+    /**
+     * 发现服务
+     */
+    public List<ServiceRegistration> discoverServices(String serviceName) {
+        try {
+            Date cutoff = new Date(System.currentTimeMillis() - 60000);  // 1分钟
+
+            Query query = new Query(Criteria.where("serviceName").is(serviceName)
+                .and("lastHeartbeat").gt(cutoff)
+                .and("status").is(ServiceStatus.ACTIVE));
+
+            return mongoTemplate.find(query, ServiceRegistration.class,
+                SERVICE_DISCOVERY_COLLECTION);
+
+        } catch (Exception e) {
+            log.error("服务发现失败: {}", serviceName, e);
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * 发现所有S3扫描器实例
+     */
+    public List<ServiceRegistration> discoverAllScannerInstances() {
+        return discoverServices("s3-scanner");
+    }
+
+    /**
+     * 主从选举
+     */
+    public Optional<String> electLeader(String serviceName) {
+        try {
+            List<ServiceRegistration> services = discoverServices(serviceName);
+
+            if (services.isEmpty()) {
+                return Optional.empty();
+            }
+
+            // 简单选举：选择最先注册的实例
+            return services.stream()
+                .min(Comparator.comparing(ServiceRegistration::getRegisteredAt))
+                .map(ServiceRegistration::getInstanceId);
+
+        } catch (Exception e) {
+            log.error("选举领导者失败: {}", serviceName, e);
+            return Optional.empty();
+        }
+    }
+}
+3.2 分布式任务分配
+java
+下载
+复制
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class DistributedTaskAllocator {
+
+    private final DistributedInstanceRegistry instanceRegistry;
+    private final ConsistentHashCoordinator hashCoordinator;
+
+    /**
+     * 分配任务给合适的实例
+     */
+    public Optional<String> allocateTask(String taskId, String taskType,
+                                        Map<String, Object> taskContext) {
+        List<InstanceInfo> activeInstances = instanceRegistry.getActiveInstances();
+
+        if (activeInstances.isEmpty()) {
+            log.warn("没有活跃实例可分配任务");
+            return Optional.empty();
+        }
+
+        // 1. 使用一致性哈希分配
+        String assignedByHash = hashCoordinator.getAssignedInstance(taskId);
+
+        // 2. 检查负载
+        InstanceInfo assignedInstance = activeInstances.stream()
+            .filter(instance -> assignedByHash.equals(instance.getInstanceId()))
+            .findFirst()
+            .orElse(null);
+
+        if (assignedInstance == null) {
+            log.warn("分配的实例不存在: {}", assignedByHash);
+            return Optional.empty();
+        }
+
+        // 3. 检查实例是否过载
+        if (isInstanceOverloaded(assignedInstance)) {
+            log.warn("实例过载，重新分配任务: {}", assignedInstance.getInstanceId());
+            return findAlternativeInstance(activeInstances, taskId);
+        }
+
+        return Optional.of(assignedInstance.getInstanceId());
+    }
+
+    /**
+     * 检查实例是否过载
+     */
+    private boolean isInstanceOverloaded(InstanceInfo instance) {
+        int load = instance.getCurrentLoad();
+        int limit = instance.getConcurrencyLimit();
+
+        // 使用率超过80%认为是过载
+        double utilization = (double) load / limit * 100;
+        return utilization > 80;
+    }
+
+    /**
+     * 查找替代实例
+     */
+    private Optional<String> findAlternativeInstance(List<InstanceInfo> instances,
+                                                    String taskId) {
+        // 按负载排序
+        List<InstanceInfo> sorted = instances.stream()
+            .sorted(Comparator.comparingDouble(
+                instance -> (double) instance.getCurrentLoad() / instance.getConcurrencyLimit()
+            ))
+            .collect(Collectors.toList());
+
+        // 选择负载最低的实例
+        if (!sorted.isEmpty()) {
+            InstanceInfo bestInstance = sorted.get(0);
+
+            if (!isInstanceOverloaded(bestInstance)) {
+                return Optional.of(bestInstance.getInstanceId());
+            }
+        }
+
+        return Optional.empty();
+    }
+}
+4. 部署配置
+4.1 Kubernetes部署
+yaml
+复制
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-scanner
+spec:
+  replicas: 3  # 3个副本
+  selector:
+    matchLabels:
+      app: s3-scanner
+  template:
+    metadata:
+      labels:
+        app: s3-scanner
+    spec:
+      containers:
+      - name: s3-scanner
+        image: s3-scanner:latest
+        env:
+        - name: APP_INSTANCE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name  # Pod名称
+        - name: APP_INSTANCE_HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: APP_INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-scanner
+spec:
+  selector:
+    app: s3-scanner
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+4.2 应用配置
+yaml
+复制
+# application-k8s.yml
+app:
+  # 实例配置
+  instance:
+    id: ${APP_INSTANCE_ID}  # Pod名称
+    hostname: ${APP_INSTANCE_HOSTNAME}
+    ip-address: ${APP_INSTANCE_IP}
+
+    # 注册配置
+    registration:
+      enabled: true
+      ttl-seconds: 90
+      heartbeat-interval: 30
+
+    # 能力配置
+    capabilities:
+      s3-scan: true
+      s3-process: true
+      distributed-coordination: true
+
+  # 扫描配置
+  scanner:
+    distributed: true
+    coordination-strategy: CONSISTENT_HASH
+    min-instances: 2
+    max-instances: 10
+5. 监控和健康检查
+5.1 集群健康检查
+java
+下载
+复制
+@RestController
+@RequestMapping("/api/cluster")
+@RequiredArgsConstructor
+public class ClusterController {
+
+    private final DistributedInstanceRegistry instanceRegistry;
+    private final ServiceDiscoveryCoordinator discoveryCoordinator;
+
+    @GetMapping("/health")
+    public Map<String, Object> getClusterHealth() {
+        Map<String, Object> health = new HashMap<>();
+
+        // 获取集群统计
+        Map<String, Object> stats = instanceRegistry.getClusterStats();
+
+        int totalInstances = (int) stats.get("totalInstances");
+        int otherInstances = (int) stats.get("otherInstances");
+
+        // 健康状态
+        if (totalInstances >= 2) {
+            health.put("status", "HEALTHY");
+            health.put("message", "集群运行正常");
+        } else if (totalInstances == 1) {
+            health.put("status", "DEGRADED");
+            health.put("message", "集群单点运行");
+        } else {
+            health.put("status", "UNHEALTHY");
+            health.put("message", "无可用实例");
+        }
+
+        health.put("totalInstances", totalInstances);
+        health.put("otherInstances", otherInstances);
+        health.put("stats", stats);
+
+        return health;
+    }
+
+    @GetMapping("/instances")
+    public List<Map<String, Object>> getAllInstances() {
+        return instanceRegistry.getActiveInstances().stream()
+            .map(instance -> {
+                Map<String, Object> map = new HashMap<>();
+                map.put("instanceId", instance.getInstanceId());
+                map.put("hostname", instance.getHostname());
+                map.put("status", instance.getStatus().name());
+                map.put("load", instance.getCurrentLoad());
+                map.put("lastHeartbeat", instance.getLastHeartbeat());
+                return map;
+            })
+            .collect(Collectors.toList());
+    }
+}
+6. 测试验证
+6.1 多实例测试
+java
+下载
+复制
+@SpringBootTest
+@ActiveProfiles("test")
+class DistributedInstanceRegistryTest {
+
+    @Autowired
+    private DistributedInstanceRegistry registry;
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    @Test
+    void testMultiInstanceRegistration() {
+        // 模拟多个实例注册
+        String instance1 = "s3-scanner-1";
+        String instance2 = "s3-scanner-2";
+        String instance3 = "s3-scanner-3";
+
+        // 注册实例1
+        registry.setInstanceId(instance1);
+        registry.registerCurrentInstance();
+
+        // 注册实例2
+        registry.setInstanceId(instance2);
+        registry.registerCurrentInstance();
+
+        // 注册实例3
+        registry.setInstanceId(instance3);
+        registry.registerCurrentInstance();
+
+        // 刷新实例状态
+        registry.refreshOtherInstances();
+
+        // 验证
+        List<InstanceInfo> activeInstances = registry.getActiveInstances();
+        assertEquals(3, activeInstances.size(), "应该有3个活跃实例");
+
+        List<String> instanceIds = activeInstances.stream()
+            .map(InstanceInfo::getInstanceId)
+            .sorted()
+            .collect(Collectors.toList());
+
+        assertArrayEquals(
+            new String[]{instance1, instance2, instance3},
+            instanceIds.toArray(new String[0]),
+            "实例ID应该匹配"
+        );
+    }
+
+    @Test
+    void testInstanceHeartbeatAndExpiration() throws InterruptedException {
+        // 注册实例
+        String instanceId = "test-instance";
+        registry.setInstanceId(instanceId);
+        registry.registerCurrentInstance();
+
+        // 初始状态
+        assertTrue(registry.isInstanceActive(instanceId), "实例应该活跃");
+
+        // 模拟心跳停止
+        Thread.sleep(110000);  // 110秒，超过TTL
+
+        // 刷新状态
+        registry.refreshOtherInstances();
+        registry.cleanupExpiredInstances();
+
+        // 验证实例过期
+        assertFalse(registry.isInstanceActive(instanceId), "实例应该过期");
+    }
+}
+7. 结论
+
+是的，你的观察是正确的！原来的实现确实有问题。
+
+问题根源：
+
+单点视角：每个实例只知道自己
+
+缺乏发现：没有从数据库加载其他实例
+
+心跳单向：只更新自己，不检查别人
+
+解决方案：
+
+双向注册：注册自己 + 发现他人
+
+定期刷新：定时从数据库加载其他实例状态
+
+完整状态：维护所有实例的完整视图
+
+修改后的行为：
+java
+下载
+复制
+// 修改后，activeInstances 会包含：
+[
+    {当前实例信息},
+    {其他实例1信息},
+    {其他实例2信息},
+    {其他实例3信息},
+    ...
+]
+关键修改点：
+
+增加 loadOtherInstances()​ 方法
+
+增加 refreshOtherInstances()​ 定时任务
+
+修改 getActiveInstances()​ 返回所有实例
+
+完善心跳机制​ 双向同步
+
+这样每个实例都能知道集群中的所有其他实例，实现真正的分布式协调。
