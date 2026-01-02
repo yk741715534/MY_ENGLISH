@@ -1,0 +1,630 @@
+PriorityTaskService 这里编译不通过
+
+
+return task.call();
+CompletableFuture<TaskResult<?>> future = submitTask(taskName, task, businessData);
+
+我看到问题了。在 PriorityTaskService中，我们需要修正几个地方。让我提供修正后的完整代码：
+
+修正后的 PriorityTaskService.java
+java
+下载
+复制
+package com.example.priorityqueue.service;
+
+import com.example.priorityqueue.core.domain.PriorityTask;
+import com.example.priorityqueue.core.domain.TaskPriority;
+import com.example.priorityqueue.core.domain.TaskResult;
+import com.example.priorityqueue.core.executor.DynamicPriorityThreadQueue;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * 优先级任务服务
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PriorityTaskService {
+
+    private final DynamicPriorityThreadQueue dynamicPriorityThreadQueue;
+    private final Map<String, CompletableFuture<?>> pendingFutures = new ConcurrentHashMap<>();
+
+    /**
+     * 提交任务
+     */
+    public <T> CompletableFuture<TaskResult<T>> submitTask(
+            String taskName,
+            java.util.concurrent.Callable<T> task,
+            Map<String, Object> businessData) {
+
+        // 创建任务ID
+        String taskId = "TASK-" + System.currentTimeMillis() + "-" +
+                       System.nanoTime() % 10000;
+
+        // 记录任务开始时间
+        LocalDateTime submitTime = LocalDateTime.now();
+
+        // 包装任务，使其能够捕获结果
+        AtomicReference<T> taskResult = new AtomicReference<>();
+        AtomicReference<Exception> taskException = new AtomicReference<>();
+
+        // 创建可追踪的任务
+        java.util.concurrent.Callable<T> trackedTask = () -> {
+            try {
+                T result = task.call();
+                taskResult.set(result);
+                return result;
+            } catch (Exception e) {
+                taskException.set(e);
+                throw e;
+            }
+        };
+
+        // 通过动态队列提交
+        String finalTaskId = dynamicPriorityThreadQueue.submitWithTracking(
+            () -> {
+                try {
+                    trackedTask.call();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            },
+            businessData
+        );
+
+        // 创建并返回CompletableFuture
+        CompletableFuture<TaskResult<T>> resultFuture = new CompletableFuture<>();
+
+        // 监控任务完成
+        monitorTaskCompletion(finalTaskId, taskName, businessData, resultFuture,
+                            submitTime, taskResult, taskException);
+
+        return resultFuture;
+    }
+
+    /**
+     * 提交任务（指定优先级）
+     */
+    public <T> CompletableFuture<TaskResult<T>> submitTaskWithPriority(
+            String taskName,
+            java.util.concurrent.Callable<T> task,
+            TaskPriority priority,
+            Map<String, Object> businessData) {
+
+        // 创建任务ID
+        String taskId = "TASK-PRI-" + System.currentTimeMillis() + "-" +
+                       System.nanoTime() % 10000;
+
+        // 记录任务开始时间
+        LocalDateTime submitTime = LocalDateTime.now();
+
+        // 包装任务，使其能够捕获结果
+        AtomicReference<T> taskResult = new AtomicReference<>();
+        AtomicReference<Exception> taskException = new AtomicReference<>();
+
+        // 创建可追踪的任务
+        java.util.concurrent.Callable<T> trackedTask = () -> {
+            try {
+                T result = task.call();
+                taskResult.set(result);
+                return result;
+            } catch (Exception e) {
+                taskException.set(e);
+                throw e;
+            }
+        };
+
+        // 通过动态队列提交
+        String finalTaskId = dynamicPriorityThreadQueue.submitWithTracking(
+            () -> {
+                try {
+                    trackedTask.call();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            },
+            businessData
+        );
+
+        // 设置指定优先级
+        dynamicPriorityThreadQueue.changePriority(finalTaskId, priority);
+
+        // 创建并返回CompletableFuture
+        CompletableFuture<TaskResult<T>> resultFuture = new CompletableFuture<>();
+
+        // 监控任务完成
+        monitorTaskCompletion(finalTaskId, taskName, businessData, resultFuture,
+                            submitTime, taskResult, taskException);
+
+        return resultFuture;
+    }
+
+    /**
+     * 监控任务完成
+     */
+    private <T> void monitorTaskCompletion(String taskId, String taskName,
+                                         Map<String, Object> businessData,
+                                         CompletableFuture<TaskResult<T>> resultFuture,
+                                         LocalDateTime submitTime,
+                                         AtomicReference<T> taskResult,
+                                         AtomicReference<Exception> taskException) {
+
+        // 定期检查任务状态
+        CompletableFuture.runAsync(() -> {
+            int maxAttempts = 300;  // 最多检查300次（30秒）
+            int attempts = 0;
+
+            while (!resultFuture.isDone() && attempts < maxAttempts) {
+                try {
+                    PriorityTask task = dynamicPriorityThreadQueue.getTask(taskId);
+                    if (task == null) {
+                        // 任务可能已被清理，检查是否有结果
+                        if (taskResult.get() != null) {
+                            resultFuture.complete(TaskResult.<T>success(
+                                taskId, taskResult.get(),
+                                submitTime, LocalDateTime.now(),
+                                TaskPriority.NORMAL));
+                        } else if (taskException.get() != null) {
+                            resultFuture.complete(TaskResult.<T>failure(
+                                taskId, taskException.get().getMessage(), "TASK_FAILED",
+                                submitTime, LocalDateTime.now(),
+                                TaskPriority.NORMAL));
+                        } else {
+                            resultFuture.complete(TaskResult.<T>failure(
+                                taskId, "任务不存在或已被清理", "TASK_NOT_FOUND",
+                                submitTime, LocalDateTime.now(), TaskPriority.NORMAL));
+                        }
+                        break;
+                    }
+
+                    switch (task.getStatus()) {
+                        case COMPLETED:
+                            T result = taskResult.get();
+                            if (result == null) {
+                                result = (T) task.getResult();
+                            }
+                            resultFuture.complete(TaskResult.<T>success(
+                                taskId, result,
+                                task.getStartTime() != null ? task.getStartTime() : submitTime,
+                                task.getFinishTime() != null ? task.getFinishTime() : LocalDateTime.now(),
+                                task.getPriority()));
+                            break;
+                        case FAILED:
+                            String errorMsg = task.getErrorMessage();
+                            if (errorMsg == null && taskException.get() != null) {
+                                errorMsg = taskException.get().getMessage();
+                            }
+                            resultFuture.complete(TaskResult.<T>failure(
+                                taskId, errorMsg, "TASK_FAILED",
+                                task.getStartTime() != null ? task.getStartTime() : submitTime,
+                                task.getFinishTime() != null ? task.getFinishTime() : LocalDateTime.now(),
+                                task.getPriority()));
+                            break;
+                        case CANCELLED:
+                            resultFuture.complete(TaskResult.<T>failure(
+                                taskId, "任务被取消", "TASK_CANCELLED",
+                                submitTime, LocalDateTime.now(),
+                                task.getPriority()));
+                            break;
+                        default:
+                            // 任务还在执行中，继续等待
+                            TimeUnit.MILLISECONDS.sleep(100);
+                            attempts++;
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    resultFuture.completeExceptionally(e);
+                } catch (Exception e) {
+                    resultFuture.completeExceptionally(e);
+                }
+            }
+
+            // 如果超时还未完成
+            if (!resultFuture.isDone()) {
+                resultFuture.complete(TaskResult.<T>failure(
+                    taskId, "任务执行超时", "TASK_TIMEOUT",
+                    submitTime, LocalDateTime.now(),
+                    TaskPriority.NORMAL));
+            }
+        });
+    }
+
+    /**
+     * 调整任务优先级
+     */
+    public boolean adjustTaskPriority(String taskId, TaskPriority newPriority) {
+        return dynamicPriorityThreadQueue.changePriority(taskId, newPriority);
+    }
+
+    /**
+     * 取消任务
+     */
+    public boolean cancelTask(String taskId) {
+        return dynamicPriorityThreadQueue.cancelTask(taskId);
+    }
+
+    /**
+     * 获取任务状态
+     */
+    public PriorityTask.TaskStatus getTaskStatus(String taskId) {
+        return dynamicPriorityThreadQueue.getTaskStatus(taskId);
+    }
+
+    /**
+     * 批量提交任务
+     */
+    public Map<String, CompletableFuture<TaskResult<?>>> submitBatch(
+            Map<String, java.util.concurrent.Callable<?>> tasks,
+            Map<String, Object> commonBusinessData) {
+
+        Map<String, CompletableFuture<TaskResult<?>>> results = new ConcurrentHashMap<>();
+
+        tasks.forEach((taskName, task) -> {
+            Map<String, Object> businessData = new ConcurrentHashMap<>(commonBusinessData);
+            businessData.put("batchTaskName", taskName);
+
+            // 使用原始的任务对象
+            java.util.concurrent.Callable<?> originalTask = task;
+
+            // 使用泛型擦除的版本
+            @SuppressWarnings("unchecked")
+            CompletableFuture<TaskResult<?>> future = (CompletableFuture<TaskResult<?>>)
+                submitTask(taskName, originalTask, businessData);
+
+            results.put(taskName, future);
+        });
+
+        return results;
+    }
+
+    /**
+     * 批量提交任务的简化版本
+     */
+    public Map<String, CompletableFuture<TaskResult<Object>>> submitBatchSimple(
+            Map<String, java.util.concurrent.Callable<Object>> tasks,
+            Map<String, Object> commonBusinessData) {
+
+        Map<String, CompletableFuture<TaskResult<Object>>> results = new ConcurrentHashMap<>();
+
+        tasks.forEach((taskName, task) -> {
+            Map<String, Object> businessData = new ConcurrentHashMap<>(commonBusinessData);
+            businessData.put("batchTaskName", taskName);
+
+            CompletableFuture<TaskResult<Object>> future = submitTask(taskName, task, businessData);
+            results.put(taskName, future);
+        });
+
+        return results;
+    }
+
+    @PostConstruct
+    public void init() {
+        log.info("PriorityTaskService 初始化完成");
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        // 清理资源
+        pendingFutures.clear();
+        log.info("PriorityTaskService 资源清理完成");
+    }
+}
+修正 PriorityThreadQueue.java中的问题
+
+在 PriorityThreadQueue.java中，我们需要修复 submit方法：
+
+java
+下载
+复制
+/**
+     * 提交任务
+     */
+    public <T> CompletableFuture<T> submit(java.util.concurrent.Callable<T> task,
+                                          Map<String, Object> businessData) {
+        TaskPriority priority = priorityEvaluator.evaluate(businessData);
+        return submit(task, priority, businessData);
+    }
+
+    /**
+     * 提交任务（指定优先级）
+     */
+    public <T> CompletableFuture<T> submit(java.util.concurrent.Callable<T> task,
+                                          TaskPriority priority,
+                                          Map<String, Object> businessData) {
+        // 创建优先级任务
+        PriorityTask priorityTask = new PriorityTask(task, priority, businessData);
+
+        // 更新统计
+        submittedTasks.get(priority).incrementAndGet();
+
+        // 创建CompletableFuture
+        CompletableFuture<T> future = new CompletableFuture<>();
+
+        // 包装任务以处理结果
+        PriorityTask wrappedTask = PriorityTask.builder()
+                .taskId(priorityTask.getTaskId())
+                .callableTask(() -> {
+                    try {
+                        T result = task.call();
+                        future.complete(result);
+                        return result;
+                    } catch (Exception e) {
+                        future.completeExceptionally(e);
+                        throw e;
+                    }
+                })
+                .priority(priority)
+                .businessData(businessData)
+                .submitTime(priorityTask.getSubmitTime())
+                .sequenceNumber(priorityTask.getSequenceNumber())
+                .build();
+
+        // 加入队列
+        taskQueue.offer(wrappedTask);
+
+        log.debug("任务提交成功: taskId={}, priority={}, queueSize={}",
+                wrappedTask.getTaskId(), priority, taskQueue.size());
+
+        return future;
+    }
+
+    /**
+     * 提交Runnable任务
+     */
+    public CompletableFuture<Void> submit(Runnable task, Map<String, Object> businessData) {
+        return submit(() -> {
+            task.run();
+            return null;
+        }, businessData);
+    }
+修正 DynamicPriorityThreadQueue.java中的 submitWithTracking方法
+java
+下载
+复制
+/**
+     * 提交任务并返回任务ID
+     */
+    public String submitWithTracking(Runnable task, Map<String, Object> businessData) {
+        TaskPriority priority = priorityEvaluator.evaluate(businessData);
+        PriorityTask priorityTask = new PriorityTask(task, priority, businessData);
+
+        taskTracker.put(priorityTask.getTaskId(), priorityTask);
+
+        // 提交任务到父类队列
+        submit(() -> {
+            task.run();
+            return null;
+        }, businessData);
+
+        return priorityTask.getTaskId();
+    }
+
+    /**
+     * 提交Callable任务并返回任务ID
+     */
+    public <T> String submitCallableWithTracking(java.util.concurrent.Callable<T> task,
+                                                Map<String, Object> businessData) {
+        TaskPriority priority = priorityEvaluator.evaluate(businessData);
+        PriorityTask priorityTask = new PriorityTask(task, priority, businessData);
+
+        taskTracker.put(priorityTask.getTaskId(), priorityTask);
+
+        // 提交任务到父类队列
+        submit(task, businessData);
+
+        return priorityTask.getTaskId();
+    }
+简化版的解决方案
+
+如果你觉得上述实现太复杂，这里有一个更简单的版本：
+
+简单版的 PriorityTaskService.java
+java
+下载
+复制
+package com.example.priorityqueue.service;
+
+import com.example.priorityqueue.core.domain.TaskPriority;
+import com.example.priorityqueue.core.domain.TaskResult;
+import com.example.priorityqueue.core.executor.DynamicPriorityThreadQueue;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * 简单版的优先级任务服务
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SimplePriorityTaskService {
+
+    private final DynamicPriorityThreadQueue dynamicPriorityThreadQueue;
+
+    /**
+     * 提交任务（返回任务ID）
+     */
+    public String submitTaskSimple(String taskName,
+                                   Runnable task,
+                                   Map<String, Object> businessData) {
+        return dynamicPriorityThreadQueue.submitWithTracking(task, businessData);
+    }
+
+    /**
+     * 提交任务（带回调）
+     */
+    public <T> CompletableFuture<T> submitTaskWithCallback(
+            String taskName,
+            java.util.concurrent.Callable<T> task,
+            Map<String, Object> businessData) {
+
+        // 记录开始时间
+        LocalDateTime startTime = LocalDateTime.now();
+
+        // 创建Future
+        CompletableFuture<T> future = new CompletableFuture<>();
+
+        // 包装任务
+        Runnable wrappedTask = () -> {
+            try {
+                T result = task.call();
+                future.complete(result);
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+        };
+
+        // 提交任务
+        dynamicPriorityThreadQueue.submitWithTracking(wrappedTask, businessData);
+
+        return future;
+    }
+
+    /**
+     * 提交任务（带结果包装）
+     */
+    public <T> CompletableFuture<TaskResult<T>> submitTaskWithResult(
+            String taskName,
+            java.util.concurrent.Callable<T> task,
+            Map<String, Object> businessData) {
+
+        LocalDateTime submitTime = LocalDateTime.now();
+
+        CompletableFuture<TaskResult<T>> resultFuture = new CompletableFuture<>();
+
+        // 包装任务
+        Runnable wrappedTask = () -> {
+            LocalDateTime startTime = LocalDateTime.now();
+            try {
+                T result = task.call();
+                LocalDateTime endTime = LocalDateTime.now();
+                TaskResult<T> taskResult = TaskResult.success(
+                    taskName + "-" + System.currentTimeMillis(),
+                    result,
+                    startTime,
+                    endTime,
+                    TaskPriority.NORMAL
+                );
+                resultFuture.complete(taskResult);
+            } catch (Exception e) {
+                LocalDateTime endTime = LocalDateTime.now();
+                TaskResult<T> taskResult = TaskResult.failure(
+                    taskName + "-" + System.currentTimeMillis(),
+                    e.getMessage(),
+                    "TASK_ERROR",
+                    startTime,
+                    endTime,
+                    TaskPriority.NORMAL
+                );
+                resultFuture.complete(taskResult);
+            }
+        };
+
+        // 提交任务
+        dynamicPriorityThreadQueue.submitWithTracking(wrappedTask, businessData);
+
+        return resultFuture;
+    }
+
+    /**
+     * 调整任务优先级
+     */
+    public boolean changePriority(String taskId, TaskPriority newPriority) {
+        return dynamicPriorityThreadQueue.changePriority(taskId, newPriority);
+    }
+
+    /**
+     * 获取任务状态
+     */
+    public com.example.priorityqueue.core.domain.PriorityTask.TaskStatus getTaskStatus(String taskId) {
+        return dynamicPriorityThreadQueue.getTaskStatus(taskId);
+    }
+}
+使用示例
+java
+下载
+复制
+package com.example.priorityqueue.controller;
+
+import com.example.priorityqueue.service.SimplePriorityTaskService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+@RestController
+@RequestMapping("/api/simple-tasks")
+@RequiredArgsConstructor
+public class SimpleTaskController {
+
+    private final SimplePriorityTaskService taskService;
+
+    @PostMapping("/submit")
+    public String submitTask(@RequestParam String taskName,
+                            @RequestParam int sleepSeconds) {
+
+        String taskId = taskService.submitTaskSimple(
+            taskName,
+            () -> {
+                try {
+                    TimeUnit.SECONDS.sleep(sleepSeconds);
+                    System.out.println("任务 " + taskName + " 执行完成，耗时 " + sleepSeconds + "秒");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            },
+            Map.of(
+                "taskType", "TEST",
+                "sleepTime", sleepSeconds
+            )
+        );
+
+        return "任务提交成功，任务ID: " + taskId;
+    }
+
+    @PostMapping("/submit-with-result")
+    public CompletableFuture<String> submitTaskWithResult(@RequestParam String taskName,
+                                                         @RequestParam int sleepSeconds) {
+
+        return taskService.submitTaskWithCallback(
+            taskName,
+            () -> {
+                TimeUnit.SECONDS.sleep(sleepSeconds);
+                return "任务 " + taskName + " 执行完成，耗时 " + sleepSeconds + "秒";
+            },
+            Map.of(
+                "taskType", "TEST",
+                "sleepTime", sleepSeconds
+            )
+        );
+    }
+}
+主要修正点总结：
+
+修正泛型问题：在 PriorityTaskService中正确处理泛型类型
+
+添加任务包装：通过 AtomicReference包装任务结果
+
+修复 Callable 调用：确保正确调用 task.call()方法
+
+简化异步监控：使用更简单的任务监控逻辑
+
+提供替代方案：提供简化版本的服务类
+
+这样应该能解决编译问题了。如果需要进一步简化，可以使用 SimplePriorityTaskService版本。
