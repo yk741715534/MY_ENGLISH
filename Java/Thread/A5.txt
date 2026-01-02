@@ -1,0 +1,2277 @@
+无返回值优先级线程队列完整代码（带单元测试）
+完整项目结构
+复制
+src/main/java/com/example/asyncqueue/
+├── config/
+│   └── AppConfig.java
+├── core/
+│   ├── task/
+│   │   ├── TaskPriority.java
+│   │   ├── TaskStatus.java
+│   │   └── AsyncTask.java
+│   ├── evaluator/
+│   │   └── PriorityEvaluator.java
+│   └── queue/
+│       └── PriorityTaskQueue.java
+├── service/
+│   └── AsyncTaskExecutor.java
+├── listener/
+│   ├── TaskLogListener.java
+│   └── TaskMetricsListener.java
+├── controller/
+│   ├── AsyncTaskController.java
+│   ├── QueueMonitorController.java
+│   └── TestController.java
+└── AsyncQueueApplication.java
+
+src/test/java/com/example/asyncqueue/
+├── core/
+│   ├── task/
+│   │   ├── TaskPriorityTest.java
+│   │   ├── TaskStatusTest.java
+│   │   └── AsyncTaskTest.java
+│   ├── evaluator/
+│   │   └── PriorityEvaluatorTest.java
+│   └── queue/
+│       └── PriorityTaskQueueTest.java
+├── service/
+│   └── AsyncTaskExecutorTest.java
+├── controller/
+│   ├── AsyncTaskControllerTest.java
+│   └── QueueMonitorControllerTest.java
+└── integration/
+    └── IntegrationTest.java
+1. 主启动类
+java
+下载
+复制
+package com.example.asyncqueue;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class AsyncQueueApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(AsyncQueueApplication.class, args);
+    }
+}
+2. 核心组件（完整代码）
+2.1 TaskPriority.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+import lombok.Getter;
+
+/**
+ * 任务优先级枚举
+ */
+@Getter
+public enum TaskPriority {
+
+    CRITICAL(0, "CRITICAL", "关键任务", 100),   // 立即执行
+    HIGH(1, "HIGH", "高优先级", 80),            // 高优先级
+    NORMAL(2, "NORMAL", "普通优先级", 50),      // 普通优先级
+    LOW(3, "LOW", "低优先级", 20),             // 低优先级
+    BACKGROUND(4, "BACKGROUND", "后台任务", 5); // 后台任务
+
+    private final int code;
+    private final String name;
+    private final String description;
+    private final int weight;
+
+    TaskPriority(int code, String name, String description, int weight) {
+        this.code = code;
+        this.name = name;
+        this.description = description;
+        this.weight = weight;
+    }
+
+    /**
+     * 根据权重获取优先级
+     */
+    public static TaskPriority fromWeight(int weight) {
+        if (weight >= 90) return CRITICAL;
+        if (weight >= 70) return HIGH;
+        if (weight >= 30) return NORMAL;
+        if (weight >= 10) return LOW;
+        return BACKGROUND;
+    }
+}
+2.2 TaskStatus.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+/**
+ * 任务状态枚举
+ */
+public enum TaskStatus {
+
+    PENDING("PENDING", "等待执行"),
+    QUEUED("QUEUED", "已入队"),
+    PROCESSING("PROCESSING", "处理中"),
+    SUCCESS("SUCCESS", "执行成功"),
+    FAILED("FAILED", "执行失败"),
+    RETRYING("RETRYING", "重试中"),
+    CANCELLED("CANCELLED", "已取消"),
+    TIMEOUT("TIMEOUT", "执行超时");
+
+    private final String code;
+    private final String description;
+
+    TaskStatus(String code, String description) {
+        this.code = code;
+        this.description = description;
+    }
+
+    public String getCode() {
+        return code;
+    }
+
+    public String getDescription() {
+        return description;
+    }
+
+    /**
+     * 是否已完成（成功或失败）
+     */
+    public boolean isCompleted() {
+        return this == SUCCESS || this == FAILED || this == CANCELLED || this == TIMEOUT;
+    }
+
+    /**
+     * 是否可执行
+     */
+    public boolean isExecutable() {
+        return this == PENDING || this == QUEUED || this == RETRYING;
+    }
+}
+2.3 AsyncTask.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+import lombok.Data;
+import lombok.Builder;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * 异步任务实体
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class AsyncTask implements Runnable, Comparable<AsyncTask> {
+
+    // 任务ID生成器
+    private static final AtomicLong ID_GENERATOR = new AtomicLong(0);
+
+    // 任务基本信息
+    private String taskId;
+    private String taskName;
+    private String taskGroup;
+
+    // 执行信息
+    private Runnable task;
+    private TaskPriority priority;
+    private TaskStatus status;
+
+    // 业务数据
+    private Map<String, Object> metadata;
+
+    // 时间信息
+    private LocalDateTime createTime;
+    private LocalDateTime queueTime;
+    private LocalDateTime startTime;
+    private LocalDateTime endTime;
+
+    // 执行统计
+    private Long executionTime;
+    private Integer retryCount;
+    private Integer maxRetryCount;
+
+    // 错误信息
+    private String errorMessage;
+    private String errorStack;
+
+    // 排序用序列号
+    private long sequenceNumber;
+
+    // 回调监听器
+    private transient TaskListener listener;
+
+    public AsyncTask(Runnable task, TaskPriority priority, Map<String, Object> metadata) {
+        this.taskId = generateTaskId();
+        this.task = task;
+        this.priority = priority;
+        this.status = TaskStatus.PENDING;
+        this.metadata = metadata;
+        this.createTime = LocalDateTime.now();
+        this.retryCount = 0;
+        this.maxRetryCount = 3;
+        this.sequenceNumber = ID_GENERATOR.getAndIncrement();
+    }
+
+    private String generateTaskId() {
+        return String.format("TASK-%d-%d",
+            System.currentTimeMillis(),
+            ID_GENERATOR.get());
+    }
+
+    @Override
+    public void run() {
+        this.queueTime = LocalDateTime.now();
+        this.status = TaskStatus.PROCESSING;
+
+        try {
+            // 执行前回调
+            if (listener != null) {
+                listener.beforeExecute(this);
+            }
+
+            this.startTime = LocalDateTime.now();
+            task.run();
+            this.endTime = LocalDateTime.now();
+
+            this.status = TaskStatus.SUCCESS;
+            this.executionTime = java.time.Duration.between(startTime, endTime).toMillis();
+
+            // 执行成功回调
+            if (listener != null) {
+                listener.onSuccess(this);
+            }
+
+        } catch (Exception e) {
+            this.endTime = LocalDateTime.now();
+            this.errorMessage = e.getMessage();
+            this.errorStack = getStackTrace(e);
+
+            if (retryCount < maxRetryCount) {
+                this.status = TaskStatus.RETRYING;
+                this.retryCount++;
+            } else {
+                this.status = TaskStatus.FAILED;
+            }
+
+            this.executionTime = java.time.Duration.between(startTime, endTime).toMillis();
+
+            // 执行失败回调
+            if (listener != null) {
+                listener.onFailure(this, e);
+            }
+
+            throw new RuntimeException("任务执行失败: " + taskId, e);
+        }
+    }
+
+    @Override
+    public int compareTo(AsyncTask other) {
+        // 优先级高的先执行（权重值小的优先级高）
+        int priorityCompare = Integer.compare(this.priority.getWeight(), other.priority.getWeight());
+        if (priorityCompare != 0) {
+            return priorityCompare;
+        }
+
+        // 同优先级按创建时间排序
+        return this.createTime.compareTo(other.createTime);
+    }
+
+    private String getStackTrace(Exception e) {
+        java.io.StringWriter sw = new java.io.StringWriter();
+        java.io.PrintWriter pw = new java.io.PrintWriter(sw);
+        e.printStackTrace(pw);
+        return sw.toString();
+    }
+
+    /**
+     * 任务监听器接口
+     */
+    public interface TaskListener {
+        void beforeExecute(AsyncTask task);
+        void onSuccess(AsyncTask task);
+        void onFailure(AsyncTask task, Exception e);
+    }
+}
+2.4 PriorityEvaluator.java
+java
+下载
+复制
+package com.example.asyncqueue.core.evaluator;
+
+import com.example.asyncqueue.core.task.TaskPriority;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 优先级评估器
+ */
+@Component
+public class PriorityEvaluator {
+
+    // 默认评估策略
+    public TaskPriority evaluateDefault(Map<String, Object> metadata) {
+        if (metadata == null || metadata.isEmpty()) {
+            return TaskPriority.NORMAL;
+        }
+
+        String taskType = (String) metadata.get("taskType");
+        if (taskType != null) {
+            switch (taskType) {
+                case "PAYMENT_CALLBACK":
+                case "ORDER_CALLBACK":
+                case "NOTIFY":
+                    return TaskPriority.CRITICAL;
+                case "LOG":
+                case "AUDIT":
+                    return TaskPriority.HIGH;
+                case "REPORT":
+                case "SYNC":
+                    return TaskPriority.NORMAL;
+                case "CLEAN":
+                case "BACKUP":
+                case "STATISTICS":
+                    return TaskPriority.LOW;
+                default:
+                    return TaskPriority.NORMAL;
+            }
+        }
+
+        return TaskPriority.NORMAL;
+    }
+
+    /**
+     * 基于业务规则的评估
+     */
+    public TaskPriority evaluateByRule(Map<String, Object> metadata) {
+        int score = 0;
+
+        // 任务类型评分
+        String taskType = (String) metadata.get("taskType");
+        if (taskType != null) {
+            score += getTaskTypeScore(taskType);
+        }
+
+        // 用户等级评分
+        String userLevel = (String) metadata.get("userLevel");
+        if (userLevel != null) {
+            score += getUserLevelScore(userLevel);
+        }
+
+        // 时间敏感度评分
+        Boolean isTimeSensitive = (Boolean) metadata.get("timeSensitive");
+        if (Boolean.TRUE.equals(isTimeSensitive)) {
+            score += 20;
+        }
+
+        // 数据重要性评分
+        Boolean isImportant = (Boolean) metadata.get("isImportant");
+        if (Boolean.TRUE.equals(isImportant)) {
+            score += 15;
+        }
+
+        // 转换为优先级
+        return TaskPriority.fromWeight(score);
+    }
+
+    private int getTaskTypeScore(String taskType) {
+        switch (taskType) {
+            case "PAYMENT": return 40;
+            case "ORDER": return 35;
+            case "LOGIN": return 30;
+            case "REGISTER": return 25;
+            case "NOTIFY": return 20;
+            case "REPORT": return 15;
+            case "CLEAN": return 5;
+            default: return 10;
+        }
+    }
+
+    private int getUserLevelScore(String userLevel) {
+        switch (userLevel) {
+            case "VIP": return 30;
+            case "GOLD": return 20;
+            case "SILVER": return 15;
+            case "NORMAL": return 10;
+            default: return 5;
+        }
+    }
+}
+2.5 PriorityTaskQueue.java
+java
+下载
+复制
+package com.example.asyncqueue.core.queue;
+
+import com.example.asyncqueue.core.task.AsyncTask;
+import com.example.asyncqueue.core.task.TaskPriority;
+import lombok.Data;
+import lombok.Builder;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 优先级阻塞队列
+ */
+@Slf4j
+@Component
+public class PriorityTaskQueue {
+
+    // 核心队列
+    private final PriorityBlockingQueue<AsyncTask> taskQueue;
+
+    // 线程池执行器
+    private final ThreadPoolExecutor executor;
+
+    // 统计信息
+    private final AtomicLong totalSubmitted = new AtomicLong(0);
+    private final AtomicLong totalProcessed = new AtomicLong(0);
+    private final AtomicLong totalFailed = new AtomicLong(0);
+    private final ConcurrentHashMap<TaskPriority, AtomicLong> priorityStats = new ConcurrentHashMap<>();
+
+    // 控制标志
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private Thread queueConsumerThread;
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public PriorityTaskQueue() {
+        // 初始化优先级队列
+        this.taskQueue = new PriorityBlockingQueue<>();
+
+        // 初始化线程池
+        int corePoolSize = Runtime.getRuntime().availableProcessors() * 2;
+        int maxPoolSize = Runtime.getRuntime().availableProcessors() * 4;
+
+        this.executor = new ThreadPoolExecutor(
+            corePoolSize,
+            maxPoolSize,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000),
+            new TaskThreadFactory(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+
+        // 初始化统计
+        for (TaskPriority priority : TaskPriority.values()) {
+            priorityStats.put(priority, new AtomicLong(0));
+        }
+    }
+
+    @PostConstruct
+    public void init() {
+        startQueueConsumer();
+        log.info("优先级任务队列初始化完成，核心线程数: {}, 最大线程数: {}",
+                executor.getCorePoolSize(), executor.getMaximumPoolSize());
+    }
+
+    @PreDestroy
+    public void destroy() {
+        shutdown();
+    }
+
+    /**
+     * 提交任务
+     */
+    public void submit(Runnable task, Map<String, Object> metadata) {
+        submit(task, null, metadata);
+    }
+
+    /**
+     * 提交任务（指定优先级）
+     */
+    public void submit(Runnable task, TaskPriority priority, Map<String, Object> metadata) {
+        if (!running.get()) {
+            throw new IllegalStateException("任务队列已关闭");
+        }
+
+        AsyncTask asyncTask = new AsyncTask(task, priority, metadata);
+        asyncTask.setStatus(com.example.asyncqueue.core.task.TaskStatus.QUEUED);
+
+        lock.lock();
+        try {
+            taskQueue.offer(asyncTask);
+
+            // 更新统计
+            totalSubmitted.incrementAndGet();
+            priorityStats.get(asyncTask.getPriority()).incrementAndGet();
+
+            log.debug("任务已提交: taskId={}, priority={}, queueSize={}",
+                    asyncTask.getTaskId(), asyncTask.getPriority(), taskQueue.size());
+
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 批量提交任务
+     */
+    public void submitBatch(Map<String, Runnable> tasks, Map<String, Object> commonMetadata) {
+        for (Map.Entry<String, Runnable> entry : tasks.entrySet()) {
+            Map<String, Object> metadata = new ConcurrentHashMap<>(commonMetadata);
+            metadata.put("taskName", entry.getKey());
+            submit(entry.getValue(), metadata);
+        }
+    }
+
+    /**
+     * 启动队列消费者
+     */
+    private void startQueueConsumer() {
+        queueConsumerThread = new Thread(this::consumeTasks, "queue-consumer");
+        queueConsumerThread.setDaemon(true);
+        queueConsumerThread.start();
+        log.info("队列消费者线程已启动");
+    }
+
+    /**
+     * 消费任务
+     */
+    private void consumeTasks() {
+        while (running.get() && !Thread.currentThread().isInterrupted()) {
+            try {
+                AsyncTask task = taskQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (task != null && task.getStatus().isExecutable()) {
+                    processTask(task);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.error("消费任务时发生异常", e);
+            }
+        }
+    }
+
+    /**
+     * 处理单个任务
+     */
+    private void processTask(AsyncTask task) {
+        executor.execute(() -> {
+            try {
+                // 更新统计
+                task.run();
+
+                if (task.getStatus() == com.example.asyncqueue.core.task.TaskStatus.SUCCESS) {
+                    totalProcessed.incrementAndGet();
+                } else if (task.getStatus() == com.example.asyncqueue.core.task.TaskStatus.FAILED) {
+                    totalFailed.incrementAndGet();
+                }
+
+                log.debug("任务处理完成: taskId={}, status={}, time={}ms",
+                        task.getTaskId(), task.getStatus(), task.getExecutionTime());
+
+            } catch (Exception e) {
+                log.error("任务执行异常: taskId=" + task.getTaskId(), e);
+
+                // 重试逻辑
+                if (task.getRetryCount() < task.getMaxRetryCount()) {
+                    log.info("任务重试: taskId={}, retryCount={}",
+                            task.getTaskId(), task.getRetryCount());
+
+                    // 重新加入队列
+                    taskQueue.offer(task);
+                } else {
+                    totalFailed.incrementAndGet();
+                }
+            }
+        });
+    }
+
+    /**
+     * 获取队列状态
+     */
+    public QueueStatus getStatus() {
+        return QueueStatus.builder()
+                .queueSize(taskQueue.size())
+                .activeThreads(executor.getActiveCount())
+                .poolSize(executor.getPoolSize())
+                .totalSubmitted(totalSubmitted.get())
+                .totalProcessed(totalProcessed.get())
+                .totalFailed(totalFailed.get())
+                .queueCapacity(1000)
+                .isRunning(running.get())
+                .build();
+    }
+
+    /**
+     * 获取优先级统计
+     */
+    public Map<TaskPriority, Long> getPriorityStatistics() {
+        Map<TaskPriority, Long> stats = new ConcurrentHashMap<>();
+        priorityStats.forEach((priority, count) ->
+            stats.put(priority, count.get()));
+        return stats;
+    }
+
+    /**
+     * 调整线程池大小
+     */
+    public void resizeThreadPool(int coreSize, int maxSize) {
+        executor.setCorePoolSize(coreSize);
+        executor.setMaximumPoolSize(maxSize);
+        log.info("线程池大小已调整: coreSize={}, maxSize={}", coreSize, maxSize);
+    }
+
+    /**
+     * 清空队列
+     */
+    public void clear() {
+        taskQueue.clear();
+        log.info("任务队列已清空");
+    }
+
+    /**
+     * 优雅关闭
+     */
+    public void shutdown() {
+        if (running.compareAndSet(true, false)) {
+            log.info("开始关闭任务队列...");
+
+            // 停止消费者线程
+            if (queueConsumerThread != null) {
+                queueConsumerThread.interrupt();
+            }
+
+            // 关闭线程池
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+
+            log.info("任务队列已关闭");
+        }
+    }
+
+    /**
+     * 自定义线程工厂
+     */
+    private static class TaskThreadFactory implements ThreadFactory {
+        private final AtomicInteger threadNumber = new AtomicInteger(1);
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread thread = new Thread(r, "task-worker-" + threadNumber.getAndIncrement());
+            thread.setDaemon(false);
+            thread.setPriority(Thread.NORM_PRIORITY);
+            return thread;
+        }
+    }
+
+    /**
+     * 队列状态DTO
+     */
+    @Data
+    @Builder
+    public static class QueueStatus {
+        private int queueSize;
+        private int activeThreads;
+        private int poolSize;
+        private int queueCapacity;
+        private long totalSubmitted;
+        private long totalProcessed;
+        private long totalFailed;
+        private boolean isRunning;
+
+        public double getSuccessRate() {
+            if (totalProcessed + totalFailed == 0) return 0.0;
+            return (double) totalProcessed / (totalProcessed + totalFailed) * 100;
+        }
+
+        public double getQueueUsage() {
+            return (double) queueSize / queueCapacity * 100;
+        }
+    }
+}
+3. 服务层
+3.1 AsyncTaskExecutor.java
+java
+下载
+复制
+package com.example.asyncqueue.service;
+
+import com.example.asyncqueue.core.evaluator.PriorityEvaluator;
+import com.example.asyncqueue.core.queue.PriorityTaskQueue;
+import com.example.asyncqueue.core.task.AsyncTask;
+import com.example.asyncqueue.core.task.TaskPriority;
+import lombok.Data;
+import lombok.Builder;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.scheduling.annotation.Scheduled;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+/**
+ * 异步任务执行器服务
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AsyncTaskExecutor {
+
+    private final PriorityTaskQueue taskQueue;
+    private final PriorityEvaluator priorityEvaluator;
+
+    // 任务跟踪器
+    private final ConcurrentMap<String, AsyncTask> taskTracker = new ConcurrentHashMap<>();
+
+    // 任务监听器
+    private final CopyOnWriteArrayList<TaskListener> listeners = new CopyOnWriteArrayList<>();
+
+    // 默认重试策略
+    private static final int DEFAULT_MAX_RETRIES = 3;
+    private static final long DEFAULT_RETRY_DELAY = 1000; // 1秒
+
+    @PostConstruct
+    public void init() {
+        log.info("异步任务执行器初始化完成");
+    }
+
+    @PreDestroy
+    public void destroy() {
+        cleanup();
+    }
+
+    /**
+     * 提交异步任务
+     */
+    public String submitTask(String taskName, Runnable task, Map<String, Object> metadata) {
+        TaskPriority priority = priorityEvaluator.evaluateDefault(metadata);
+        return submitTask(taskName, task, priority, metadata);
+    }
+
+    /**
+     * 提交异步任务（指定优先级）
+     */
+    public String submitTask(String taskName, Runnable task, TaskPriority priority,
+                           Map<String, Object> metadata) {
+        // 包装任务，添加监控
+        Runnable monitoredTask = wrapWithMonitoring(taskName, task, metadata);
+
+        // 创建异步任务
+        AsyncTask asyncTask = new AsyncTask(monitoredTask, priority, metadata);
+        asyncTask.setTaskName(taskName);
+
+        // 注册监听器
+        asyncTask.setListener(new AsyncTask.TaskListener() {
+            @Override
+            public void beforeExecute(AsyncTask task) {
+                notifyBeforeExecute(task);
+            }
+
+            @Override
+            public void onSuccess(AsyncTask task) {
+                notifyOnSuccess(task);
+                taskTracker.remove(task.getTaskId());
+            }
+
+            @Override
+            public void onFailure(AsyncTask task, Exception e) {
+                notifyOnFailure(task, e);
+                handleRetry(task, e);
+            }
+        });
+
+        // 跟踪任务
+        taskTracker.put(asyncTask.getTaskId(), asyncTask);
+
+        // 提交到队列
+        taskQueue.submit(asyncTask.getTask(), priority, metadata);
+
+        log.info("异步任务已提交: taskId={}, name={}, priority={}",
+                asyncTask.getTaskId(), taskName, priority);
+
+        return asyncTask.getTaskId();
+    }
+
+    /**
+     * 提交延迟任务
+     */
+    public String submitDelayedTask(String taskName, Runnable task,
+                                   long delay, TimeUnit unit,
+                                   Map<String, Object> metadata) {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        String taskId = "DELAYED-" + System.currentTimeMillis() + "-" + taskName;
+
+        scheduler.schedule(() -> {
+            try {
+                submitTask(taskName, task, metadata);
+            } finally {
+                scheduler.shutdown();
+            }
+        }, delay, unit);
+
+        return taskId;
+    }
+
+    /**
+     * 提交周期性任务
+     */
+    public String submitPeriodicTask(String taskName, Runnable task,
+                                    long initialDelay, long period, TimeUnit unit,
+                                    Map<String, Object> metadata) {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        String taskId = "PERIODIC-" + System.currentTimeMillis() + "-" + taskName;
+
+        AtomicInteger executionCount = new AtomicInteger(0);
+
+        scheduler.scheduleAtFixedRate(() -> {
+            int count = executionCount.incrementAndGet();
+            Map<String, Object> taskMetadata = new ConcurrentHashMap<>(metadata);
+            taskMetadata.put("executionCount", count);
+            taskMetadata.put("periodic", true);
+
+            submitTask(taskName + "-" + count, task, taskMetadata);
+        }, initialDelay, period, unit);
+
+        return taskId;
+    }
+
+    /**
+     * 批量提交任务
+     */
+    public void submitBatch(String batchName, Map<String, Runnable> tasks,
+                          Map<String, Object> commonMetadata) {
+        log.info("开始批量提交任务: batchName={}, taskCount={}", batchName, tasks.size());
+
+        AtomicInteger completed = new AtomicInteger(0);
+
+        for (Map.Entry<String, Runnable> entry : tasks.entrySet()) {
+            Map<String, Object> metadata = new ConcurrentHashMap<>(commonMetadata);
+            metadata.put("batchName", batchName);
+            metadata.put("taskIndex", completed.get() + 1);
+
+            submitTask(entry.getKey(), entry.getValue(), metadata);
+            completed.incrementAndGet();
+        }
+
+        log.info("批量任务提交完成: batchName={}, submitted={}", batchName, completed.get());
+    }
+
+    /**
+     * 包装任务，添加监控
+     */
+    private Runnable wrapWithMonitoring(String taskName, Runnable originalTask,
+                                       Map<String, Object> metadata) {
+        return () -> {
+            String threadName = Thread.currentThread().getName();
+            LocalDateTime startTime = LocalDateTime.now();
+
+            log.debug("开始执行任务: name={}, thread={}, time={}",
+                    taskName, threadName, startTime);
+
+            try {
+                originalTask.run();
+
+                LocalDateTime endTime = LocalDateTime.now();
+                long duration = java.time.Duration.between(startTime, endTime).toMillis();
+
+                log.debug("任务执行成功: name={}, duration={}ms", taskName, duration);
+
+            } catch (Exception e) {
+                LocalDateTime endTime = LocalDateTime.now();
+                long duration = java.time.Duration.between(startTime, endTime).toMillis();
+
+                log.error("任务执行失败: name={}, duration={}ms, error={}",
+                        taskName, duration, e.getMessage(), e);
+                throw e;
+            }
+        };
+    }
+
+    /**
+     * 处理重试
+     */
+    private void handleRetry(AsyncTask task, Exception e) {
+        if (task.getRetryCount() < task.getMaxRetryCount()) {
+            try {
+                TimeUnit.MILLISECONDS.sleep(DEFAULT_RETRY_DELAY);
+
+                log.info("任务重试: taskId={}, retryCount={}",
+                        task.getTaskId(), task.getRetryCount() + 1);
+
+                // 重新提交任务
+                taskQueue.submit(task.getTask(), task.getPriority(), task.getMetadata());
+
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                log.error("重试等待被中断", ie);
+            }
+        } else {
+            log.error("任务达到最大重试次数: taskId={}, maxRetries={}",
+                    task.getTaskId(), task.getMaxRetryCount());
+        }
+    }
+
+    /**
+     * 添加任务监听器
+     */
+    public void addListener(TaskListener listener) {
+        listeners.add(listener);
+    }
+
+    /**
+     * 移除任务监听器
+     */
+    public void removeListener(TaskListener listener) {
+        listeners.remove(listener);
+    }
+
+    private void notifyBeforeExecute(AsyncTask task) {
+        for (TaskListener listener : listeners) {
+            try {
+                listener.beforeExecute(task);
+            } catch (Exception e) {
+                log.error("任务监听器执行异常", e);
+            }
+        }
+    }
+
+    private void notifyOnSuccess(AsyncTask task) {
+        for (TaskListener listener : listeners) {
+            try {
+                listener.onSuccess(task);
+            } catch (Exception e) {
+                log.error("任务监听器执行异常", e);
+            }
+        }
+    }
+
+    private void notifyOnFailure(AsyncTask task, Exception e) {
+        for (TaskListener listener : listeners) {
+            try {
+                listener.onFailure(task, e);
+            } catch (Exception e2) {
+                log.error("任务监听器执行异常", e2);
+            }
+        }
+    }
+
+    /**
+     * 获取执行统计
+     */
+    public ExecutionStats getStats() {
+        PriorityTaskQueue.QueueStatus status = taskQueue.getStatus();
+
+        return ExecutionStats.builder()
+                .totalSubmitted(status.getTotalSubmitted())
+                .totalProcessed(status.getTotalProcessed())
+                .totalFailed(status.getTotalFailed())
+                .successRate(status.getSuccessRate())
+                .queueSize(status.getQueueSize())
+                .activeThreads(status.getActiveThreads())
+                .trackedTasks(taskTracker.size())
+                .timestamp(LocalDateTime.now())
+                .build();
+    }
+
+    /**
+     * 清理已完成的任务
+     */
+    @Scheduled(fixedDelay = 300000) // 每5分钟清理一次
+    public void cleanupCompletedTasks() {
+        int beforeSize = taskTracker.size();
+
+        taskTracker.entrySet().removeIf(entry -> {
+            AsyncTask task = entry.getValue();
+            return task.getStatus().isCompleted() &&
+                   task.getEndTime() != null &&
+                   task.getEndTime().plusMinutes(30).isBefore(LocalDateTime.now());
+        });
+
+        int removed = beforeSize - taskTracker.size();
+        if (removed > 0) {
+            log.debug("清理已完成任务: removed={}, remaining={}", removed, taskTracker.size());
+        }
+    }
+
+    /**
+     * 获取活动任务数
+     */
+    public int getActiveTaskCount() {
+        return taskTracker.size();
+    }
+
+    /**
+     * 优雅关闭
+     */
+    public void cleanup() {
+        log.info("清理异步任务执行器，当前活动任务数: {}", taskTracker.size());
+        listeners.clear();
+    }
+
+    /**
+     * 任务监听器接口
+     */
+    public interface TaskListener {
+        void beforeExecute(AsyncTask task);
+        void onSuccess(AsyncTask task);
+        void onFailure(AsyncTask task, Exception e);
+    }
+
+    /**
+     * 执行统计DTO
+     */
+    @Data
+    @Builder
+    public static class ExecutionStats {
+        private long totalSubmitted;
+        private long totalProcessed;
+        private long totalFailed;
+        private double successRate;
+        private int queueSize;
+        private int activeThreads;
+        private int trackedTasks;
+        private LocalDateTime timestamp;
+    }
+}
+4. 监听器
+4.1 TaskLogListener.java
+java
+下载
+复制
+package com.example.asyncqueue.listener;
+
+import com.example.asyncqueue.service.AsyncTaskExecutor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+
+/**
+ * 任务日志监听器
+ */
+@Slf4j
+@Component
+public class TaskLogListener implements AsyncTaskExecutor.TaskListener {
+
+    private final AsyncTaskExecutor taskExecutor;
+
+    public TaskLogListener(AsyncTaskExecutor taskExecutor) {
+        this.taskExecutor = taskExecutor;
+    }
+
+    @PostConstruct
+    public void init() {
+        taskExecutor.addListener(this);
+    }
+
+    @Override
+    public void beforeExecute(com.example.asyncqueue.core.task.AsyncTask task) {
+        log.info("任务开始执行: taskId={}, name={}, priority={}, metadata={}",
+                task.getTaskId(), task.getTaskName(), task.getPriority(), task.getMetadata());
+    }
+
+    @Override
+    public void onSuccess(com.example.asyncqueue.core.task.AsyncTask task) {
+        log.info("任务执行成功: taskId={}, name={}, time={}ms",
+                task.getTaskId(), task.getTaskName(), task.getExecutionTime());
+    }
+
+    @Override
+    public void onFailure(com.example.asyncqueue.core.task.AsyncTask task, Exception e) {
+        log.error("任务执行失败: taskId={}, name={}, error={}, retryCount={}",
+                task.getTaskId(), task.getTaskName(), e.getMessage(), task.getRetryCount());
+    }
+}
+5. 控制器
+5.1 AsyncTaskController.java
+java
+下载
+复制
+package com.example.asyncqueue.controller;
+
+import com.example.asyncqueue.core.task.TaskPriority;
+import com.example.asyncqueue.service.AsyncTaskExecutor;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 异步任务控制器
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/async/tasks")
+@RequiredArgsConstructor
+public class AsyncTaskController {
+
+    private final AsyncTaskExecutor taskExecutor;
+
+    @PostMapping("/submit")
+    public ResponseEntity<Map<String, Object>> submitTask(
+            @RequestParam String taskName,
+            @RequestParam(required = false) Integer sleepSeconds,
+            @RequestBody(required = false) Map<String, Object> metadata) {
+
+        int sleepTime = sleepSeconds != null ? sleepSeconds : 1;
+
+        String taskId = taskExecutor.submitTask(taskName, () -> {
+            try {
+                log.info("执行任务: {}", taskName);
+                TimeUnit.SECONDS.sleep(sleepTime);
+                log.info("任务完成: {}", taskName);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("任务被中断: {}", taskName, e);
+            }
+        }, metadata != null ? metadata : new ConcurrentHashMap<>());
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "任务提交成功",
+            "taskId", taskId,
+            "taskName", taskName
+        ));
+    }
+
+    @PostMapping("/submit-with-priority")
+    public ResponseEntity<Map<String, Object>> submitTaskWithPriority(
+            @RequestParam String taskName,
+            @RequestParam TaskPriority priority,
+            @RequestParam(required = false) Integer sleepSeconds,
+            @RequestBody(required = false) Map<String, Object> metadata) {
+
+        int sleepTime = sleepSeconds != null ? sleepSeconds : 1;
+
+        String taskId = taskExecutor.submitTask(taskName, () -> {
+            try {
+                log.info("执行{}任务: {}", priority, taskName);
+                TimeUnit.SECONDS.sleep(sleepTime);
+                log.info("{}任务完成: {}", priority, taskName);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("任务被中断: {}", taskName, e);
+            }
+        }, priority, metadata != null ? metadata : new ConcurrentHashMap<>());
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "任务提交成功",
+            "taskId", taskId,
+            "taskName", taskName,
+            "priority", priority
+        ));
+    }
+
+    @PostMapping("/delayed")
+    public ResponseEntity<Map<String, Object>> submitDelayedTask(
+            @RequestParam String taskName,
+            @RequestParam Long delay,
+            @RequestParam(defaultValue = "SECONDS") TimeUnit unit,
+            @RequestBody(required = false) Map<String, Object> metadata) {
+
+        String taskId = taskExecutor.submitDelayedTask(taskName, () -> {
+            log.info("执行延迟任务: {}, delay={} {}", taskName, delay, unit);
+        }, delay, unit, metadata != null ? metadata : new ConcurrentHashMap<>());
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "延迟任务提交成功",
+            "taskId", taskId,
+            "taskName", taskName,
+            "delay", delay,
+            "unit", unit
+        ));
+    }
+
+    @PostMapping("/periodic")
+    public ResponseEntity<Map<String, Object>> submitPeriodicTask(
+            @RequestParam String taskName,
+            @RequestParam Long initialDelay,
+            @RequestParam Long period,
+            @RequestParam(defaultValue = "SECONDS") TimeUnit unit,
+            @RequestBody(required = false) Map<String, Object> metadata) {
+
+        String taskId = taskExecutor.submitPeriodicTask(taskName, () -> {
+            log.info("执行周期性任务: {}", taskName);
+        }, initialDelay, period, unit, metadata != null ? metadata : new ConcurrentHashMap<>());
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "周期性任务提交成功",
+            "taskId", taskId,
+            "taskName", taskName,
+            "initialDelay", initialDelay,
+            "period", period,
+            "unit", unit
+        ));
+    }
+
+    @PostMapping("/batch")
+    public ResponseEntity<Map<String, Object>> submitBatch(
+            @RequestParam String batchName,
+            @RequestParam Integer taskCount,
+            @RequestBody(required = false) Map<String, Object> metadata) {
+
+        Map<String, Runnable> tasks = new ConcurrentHashMap<>();
+        for (int i = 1; i <= taskCount; i++) {
+            final int index = i;
+            tasks.put("batch-task-" + i, () -> {
+                try {
+                    log.info("执行批量任务: {} - {}", batchName, index);
+                    TimeUnit.MILLISECONDS.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        taskExecutor.submitBatch(batchName, tasks,
+            metadata != null ? metadata : new ConcurrentHashMap<>());
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "批量任务提交成功",
+            "batchName", batchName,
+            "taskCount", taskCount
+        ));
+    }
+
+    @GetMapping("/stats")
+    public ResponseEntity<Map<String, Object>> getStats() {
+        AsyncTaskExecutor.ExecutionStats stats = taskExecutor.getStats();
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "stats", Map.of(
+                "totalSubmitted", stats.getTotalSubmitted(),
+                "totalProcessed", stats.getTotalProcessed(),
+                "totalFailed", stats.getTotalFailed(),
+                "successRate", String.format("%.2f%%", stats.getSuccessRate()),
+                "queueSize", stats.getQueueSize(),
+                "activeThreads", stats.getActiveThreads(),
+                "trackedTasks", stats.getTrackedTasks(),
+                "timestamp", stats.getTimestamp()
+            )
+        ));
+    }
+}
+5.2 QueueMonitorController.java
+java
+下载
+复制
+package com.example.asyncqueue.controller;
+
+import com.example.asyncqueue.core.queue.PriorityTaskQueue;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.Map;
+
+/**
+ * 队列监控控制器
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/async/monitor")
+@RequiredArgsConstructor
+public class QueueMonitorController {
+
+    private final PriorityTaskQueue taskQueue;
+
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Object>> getQueueStatus() {
+        PriorityTaskQueue.QueueStatus status = taskQueue.getStatus();
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "status", Map.of(
+                "queueSize", status.getQueueSize(),
+                "activeThreads", status.getActiveThreads(),
+                "poolSize", status.getPoolSize(),
+                "totalSubmitted", status.getTotalSubmitted(),
+                "totalProcessed", status.getTotalProcessed(),
+                "totalFailed", status.getTotalFailed(),
+                "successRate", String.format("%.2f%%", status.getSuccessRate()),
+                "queueUsage", String.format("%.2f%%", status.getQueueUsage()),
+                "isRunning", status.isRunning()
+            )
+        ));
+    }
+
+    @GetMapping("/priority-stats")
+    public ResponseEntity<Map<String, Object>> getPriorityStats() {
+        Map<com.example.asyncqueue.core.task.TaskPriority, Long> stats =
+            taskQueue.getPriorityStatistics();
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "priorityStats", stats
+        ));
+    }
+
+    @PostMapping("/resize")
+    public ResponseEntity<Map<String, Object>> resizeThreadPool(
+            @RequestParam int coreSize,
+            @RequestParam int maxSize) {
+
+        taskQueue.resizeThreadPool(coreSize, maxSize);
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "线程池大小已调整",
+            "coreSize", coreSize,
+            "maxSize", maxSize
+        ));
+    }
+
+    @PostMapping("/clear")
+    public ResponseEntity<Map<String, Object>> clearQueue() {
+        taskQueue.clear();
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "队列已清空"
+        ));
+    }
+
+    @PostMapping("/shutdown")
+    public ResponseEntity<Map<String, Object>> shutdownQueue() {
+        taskQueue.shutdown();
+
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "队列已关闭"
+        ));
+    }
+}
+6. 配置类
+6.1 AppConfig.java
+java
+下载
+复制
+package com.example.asyncqueue.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@Configuration
+@EnableScheduling
+public class AppConfig {
+    // 配置类
+}
+7. 单元测试
+7.1 TaskPriorityTest.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class TaskPriorityTest {
+
+    @Test
+    void testFromWeight() {
+        assertEquals(TaskPriority.CRITICAL, TaskPriority.fromWeight(100));
+        assertEquals(TaskPriority.CRITICAL, TaskPriority.fromWeight(95));
+        assertEquals(TaskPriority.HIGH, TaskPriority.fromWeight(80));
+        assertEquals(TaskPriority.HIGH, TaskPriority.fromWeight(75));
+        assertEquals(TaskPriority.NORMAL, TaskPriority.fromWeight(50));
+        assertEquals(TaskPriority.NORMAL, TaskPriority.fromWeight(40));
+        assertEquals(TaskPriority.LOW, TaskPriority.fromWeight(20));
+        assertEquals(TaskPriority.LOW, TaskPriority.fromWeight(15));
+        assertEquals(TaskPriority.BACKGROUND, TaskPriority.fromWeight(5));
+        assertEquals(TaskPriority.BACKGROUND, TaskPriority.fromWeight(0));
+    }
+
+    @Test
+    void testGetters() {
+        TaskPriority priority = TaskPriority.HIGH;
+
+        assertEquals(1, priority.getCode());
+        assertEquals("HIGH", priority.getName());
+        assertEquals("高优先级", priority.getDescription());
+        assertEquals(80, priority.getWeight());
+    }
+
+    @Test
+    void testValues() {
+        TaskPriority[] priorities = TaskPriority.values();
+
+        assertEquals(5, priorities.length);
+        assertEquals(TaskPriority.CRITICAL, priorities[0]);
+        assertEquals(TaskPriority.HIGH, priorities[1]);
+        assertEquals(TaskPriority.NORMAL, priorities[2]);
+        assertEquals(TaskPriority.LOW, priorities[3]);
+        assertEquals(TaskPriority.BACKGROUND, priorities[4]);
+    }
+}
+7.2 TaskStatusTest.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class TaskStatusTest {
+
+    @Test
+    void testIsCompleted() {
+        assertTrue(TaskStatus.SUCCESS.isCompleted());
+        assertTrue(TaskStatus.FAILED.isCompleted());
+        assertTrue(TaskStatus.CANCELLED.isCompleted());
+        assertTrue(TaskStatus.TIMEOUT.isCompleted());
+
+        assertFalse(TaskStatus.PENDING.isCompleted());
+        assertFalse(TaskStatus.QUEUED.isCompleted());
+        assertFalse(TaskStatus.PROCESSING.isCompleted());
+        assertFalse(TaskStatus.RETRYING.isCompleted());
+    }
+
+    @Test
+    void testIsExecutable() {
+        assertTrue(TaskStatus.PENDING.isExecutable());
+        assertTrue(TaskStatus.QUEUED.isExecutable());
+        assertTrue(TaskStatus.RETRYING.isExecutable());
+
+        assertFalse(TaskStatus.PROCESSING.isExecutable());
+        assertFalse(TaskStatus.SUCCESS.isExecutable());
+        assertFalse(TaskStatus.FAILED.isExecutable());
+        assertFalse(TaskStatus.CANCELLED.isExecutable());
+        assertFalse(TaskStatus.TIMEOUT.isExecutable());
+    }
+
+    @Test
+    void testGetters() {
+        TaskStatus status = TaskStatus.PROCESSING;
+
+        assertEquals("PROCESSING", status.getCode());
+        assertEquals("处理中", status.getDescription());
+    }
+}
+7.3 AsyncTaskTest.java
+java
+下载
+复制
+package com.example.asyncqueue.core.task;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import java.util.HashMap;
+import java.util.Map;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AsyncTaskTest {
+
+    @Mock
+    private Runnable mockTask;
+
+    @Mock
+    private AsyncTask.TaskListener mockListener;
+
+    private Map<String, Object> metadata;
+
+    @BeforeEach
+    void setUp() {
+        metadata = new HashMap<>();
+        metadata.put("test", "value");
+    }
+
+    @Test
+    void testConstructor() {
+        AsyncTask asyncTask = new AsyncTask(mockTask, TaskPriority.HIGH, metadata);
+
+        assertNotNull(asyncTask.getTaskId());
+        assertEquals(mockTask, asyncTask.getTask());
+        assertEquals(TaskPriority.HIGH, asyncTask.getPriority());
+        assertEquals(TaskStatus.PENDING, asyncTask.getStatus());
+        assertEquals(metadata, asyncTask.getMetadata());
+        assertNotNull(asyncTask.getCreateTime());
+        assertEquals(0, asyncTask.getRetryCount().intValue());
+        assertEquals(3, asyncTask.getMaxRetryCount().intValue());
+    }
+
+    @Test
+    void testRunSuccess() {
+        AsyncTask asyncTask = new AsyncTask(mockTask, TaskPriority.NORMAL, metadata);
+        asyncTask.setListener(mockListener);
+
+        doNothing().when(mockTask).run();
+
+        asyncTask.run();
+
+        verify(mockListener, times(1)).beforeExecute(asyncTask);
+        verify(mockListener, times(1)).onSuccess(asyncTask);
+        verify(mockTask, times(1)).run();
+
+        assertEquals(TaskStatus.SUCCESS, asyncTask.getStatus());
+        assertNotNull(asyncTask.getStartTime());
+        assertNotNull(asyncTask.getEndTime());
+        assertNotNull(asyncTask.getExecutionTime());
+        assertNull(asyncTask.getErrorMessage());
+    }
+
+    @Test
+    void testRunFailure() {
+        RuntimeException exception = new RuntimeException("Test exception");
+        AsyncTask asyncTask = new AsyncTask(mockTask, TaskPriority.NORMAL, metadata);
+        asyncTask.setListener(mockListener);
+
+        doThrow(exception).when(mockTask).run();
+
+        assertThrows(RuntimeException.class, asyncTask::run);
+
+        verify(mockListener, times(1)).beforeExecute(asyncTask);
+        verify(mockListener, times(1)).onFailure(asyncTask, exception);
+
+        assertEquals(TaskStatus.RETRYING, asyncTask.getStatus());
+        assertEquals(1, asyncTask.getRetryCount().intValue());
+        assertNotNull(asyncTask.getErrorMessage());
+        assertNotNull(asyncTask.getErrorStack());
+    }
+
+    @Test
+    void testCompareTo() throws InterruptedException {
+        AsyncTask task1 = new AsyncTask(mockTask, TaskPriority.HIGH, metadata);
+        Thread.sleep(10); // 确保时间不同
+        AsyncTask task2 = new AsyncTask(mockTask, TaskPriority.LOW, metadata);
+
+        // HIGH 优先级更高（权重值更小），应该排在前面
+        assertTrue(task1.compareTo(task2) < 0);
+
+        // 相同优先级，按创建时间排序
+        AsyncTask task3 = new AsyncTask(mockTask, TaskPriority.HIGH, metadata);
+        Thread.sleep(10);
+        AsyncTask task4 = new AsyncTask(mockTask, TaskPriority.HIGH, metadata);
+
+        assertTrue(task3.compareTo(task4) < 0);
+    }
+
+    @Test
+    void testTaskIdFormat() {
+        AsyncTask asyncTask = new AsyncTask(mockTask, TaskPriority.NORMAL, metadata);
+
+        assertTrue(asyncTask.getTaskId().startsWith("TASK-"));
+        assertTrue(asyncTask.getTaskId().contains("-"));
+    }
+}
+7.4 PriorityEvaluatorTest.java
+java
+下载
+复制
+package com.example.asyncqueue.core.evaluator;
+
+import com.example.asyncqueue.core.task.TaskPriority;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.junit.jupiter.MockitoExtension;
+import java.util.HashMap;
+import java.util.Map;
+import static org.junit.jupiter.api.Assertions.*;
+
+@ExtendWith(MockitoExtension.class)
+class PriorityEvaluatorTest {
+
+    private PriorityEvaluator evaluator;
+
+    @BeforeEach
+    void setUp() {
+        evaluator = new PriorityEvaluator();
+    }
+
+    @Test
+    void testEvaluateDefault_NullMetadata() {
+        assertEquals(TaskPriority.NORMAL, evaluator.evaluateDefault(null));
+        assertEquals(TaskPriority.NORMAL, evaluator.evaluateDefault(new HashMap<>()));
+    }
+
+    @Test
+    void testEvaluateDefault_CriticalTasks() {
+        Map<String, Object> metadata = new HashMap<>();
+
+        metadata.put("taskType", "PAYMENT_CALLBACK");
+        assertEquals(TaskPriority.CRITICAL, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "ORDER_CALLBACK");
+        assertEquals(TaskPriority.CRITICAL, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "NOTIFY");
+        assertEquals(TaskPriority.CRITICAL, evaluator.evaluateDefault(metadata));
+    }
+
+    @Test
+    void testEvaluateDefault_HighTasks() {
+        Map<String, Object> metadata = new HashMap<>();
+
+        metadata.put("taskType", "LOG");
+        assertEquals(TaskPriority.HIGH, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "AUDIT");
+        assertEquals(TaskPriority.HIGH, evaluator.evaluateDefault(metadata));
+    }
+
+    @Test
+    void testEvaluateDefault_NormalTasks() {
+        Map<String, Object> metadata = new HashMap<>();
+
+        metadata.put("taskType", "REPORT");
+        assertEquals(TaskPriority.NORMAL, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "SYNC");
+        assertEquals(TaskPriority.NORMAL, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "UNKNOWN");
+        assertEquals(TaskPriority.NORMAL, evaluator.evaluateDefault(metadata));
+    }
+
+    @Test
+    void testEvaluateDefault_LowTasks() {
+        Map<String, Object> metadata = new HashMap<>();
+
+        metadata.put("taskType", "CLEAN");
+        assertEquals(TaskPriority.LOW, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "BACKUP");
+        assertEquals(TaskPriority.LOW, evaluator.evaluateDefault(metadata));
+
+        metadata.put("taskType", "STATISTICS");
+        assertEquals(TaskPriority.LOW, evaluator.evaluateDefault(metadata));
+    }
+
+    @Test
+    void testEvaluateByRule() {
+        Map<String, Object> metadata = new HashMap<>();
+
+        // 测试高分（应该为CRITICAL）
+        metadata.put("taskType", "PAYMENT");
+        metadata.put("userLevel", "VIP");
+        metadata.put("timeSensitive", true);
+        metadata.put("isImportant", true);
+
+        // 计算分数：40 + 30 + 20 + 15 = 105
+        assertEquals(TaskPriority.CRITICAL, evaluator.evaluateByRule(metadata));
+
+        // 测试中等分数（应该为NORMAL）
+        metadata.clear();
+        metadata.put("taskType", "REPORT");
+        metadata.put("userLevel", "NORMAL");
+        metadata.put("timeSensitive", false);
+        metadata.put("isImportant", false);
+
+        // 计算分数：15 + 10 = 25
+        assertEquals(TaskPriority.LOW, evaluator.evaluateByRule(metadata));
+
+        // 测试低分（应该为BACKGROUND）
+        metadata.clear();
+        metadata.put("taskType", "CLEAN");
+
+        // 计算分数：5
+        assertEquals(TaskPriority.BACKGROUND, evaluator.evaluateByRule(metadata));
+    }
+
+    @Test
+    void testGetTaskTypeScore() throws Exception {
+        // 通过反射测试私有方法
+        var method = PriorityEvaluator.class.getDeclaredMethod("getTaskTypeScore", String.class);
+        method.setAccessible(true);
+
+        assertEquals(40, (int) method.invoke(evaluator, "PAYMENT"));
+        assertEquals(35, (int) method.invoke(evaluator, "ORDER"));
+        assertEquals(30, (int) method.invoke(evaluator, "LOGIN"));
+        assertEquals(25, (int) method.invoke(evaluator, "REGISTER"));
+        assertEquals(20, (int) method.invoke(evaluator, "NOTIFY"));
+        assertEquals(15, (int) method.invoke(evaluator, "REPORT"));
+        assertEquals(5, (int) method.invoke(evaluator, "CLEAN"));
+        assertEquals(10, (int) method.invoke(evaluator, "UNKNOWN"));
+    }
+
+    @Test
+    void testGetUserLevelScore() throws Exception {
+        // 通过反射测试私有方法
+        var method = PriorityEvaluator.class.getDeclaredMethod("getUserLevelScore", String.class);
+        method.setAccessible(true);
+
+        assertEquals(30, (int) method.invoke(evaluator, "VIP"));
+        assertEquals(20, (int) method.invoke(evaluator, "GOLD"));
+        assertEquals(15, (int) method.invoke(evaluator, "SILVER"));
+        assertEquals(10, (int) method.invoke(evaluator, "NORMAL"));
+        assertEquals(5, (int) method.invoke(evaluator, "UNKNOWN"));
+    }
+}
+7.5 PriorityTaskQueueTest.java
+java
+下载
+复制
+package com.example.asyncqueue.core.queue;
+
+import com.example.asyncqueue.core.task.AsyncTask;
+import com.example.asyncqueue.core.task.TaskPriority;
+import com.example.asyncqueue.core.task.TaskStatus;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.junit.jupiter.MockitoExtension;
+import java.lang.reflect.Field;
+import java.util.Map;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class PriorityTaskQueueTest {
+
+    private PriorityTaskQueue queue;
+    private ThreadPoolExecutor mockExecutor;
+    private PriorityBlockingQueue<AsyncTask> mockQueue;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        queue = new PriorityTaskQueue();
+
+        // 通过反射获取私有字段
+        Field executorField = PriorityTaskQueue.class.getDeclaredField("executor");
+        executorField.setAccessible(true);
+        mockExecutor = mock(ThreadPoolExecutor.class);
+        executorField.set(queue, mockExecutor);
+
+        Field queueField = PriorityTaskQueue.class.getDeclaredField("taskQueue");
+        queueField.setAccessible(true);
+        mockQueue = mock(PriorityBlockingQueue.class);
+        queueField.set(queue, mockQueue);
+
+        Field runningField = PriorityTaskQueue.class.getDeclaredField("running");
+        runningField.setAccessible(true);
+        AtomicBoolean running = (AtomicBoolean) runningField.get(queue);
+        running.set(true);
+    }
+
+    @AfterEach
+    void tearDown() throws Exception {
+        Field runningField = PriorityTaskQueue.class.getDeclaredField("running");
+        runningField.setAccessible(true);
+        AtomicBoolean running = (AtomicBoolean) runningField.get(queue);
+        running.set(false);
+    }
+
+    @Test
+    void testSubmit() {
+        Runnable task = () -> System.out.println("Test task");
+        Map<String, Object> metadata = Map.of("key", "value");
+
+        queue.submit(task, metadata);
+
+        verify(mockQueue, times(1)).offer(any(AsyncTask.class));
+    }
+
+    @Test
+    void testSubmitWithPriority() {
+        Runnable task = () -> System.out.println("Test task");
+        Map<String, Object> metadata = Map.of("key", "value");
+
+        queue.submit(task, TaskPriority.HIGH, metadata);
+
+        verify(mockQueue, times(1)).offer(any(AsyncTask.class));
+    }
+
+    @Test
+    void testSubmitWhenShutdown() throws Exception {
+        Field runningField = PriorityTaskQueue.class.getDeclaredField("running");
+        runningField.setAccessible(true);
+        AtomicBoolean running = (AtomicBoolean) runningField.get(queue);
+        running.set(false);
+
+        Runnable task = () -> System.out.println("Test task");
+        Map<String, Object> metadata = Map.of("key", "value");
+
+        assertThrows(IllegalStateException.class, () -> {
+            queue.submit(task, metadata);
+        });
+    }
+
+    @Test
+    void testGetStatus() {
+        when(mockExecutor.getActiveCount()).thenReturn(5);
+        when(mockExecutor.getPoolSize()).thenReturn(10);
+        when(mockQueue.size()).thenReturn(3);
+
+        PriorityTaskQueue.QueueStatus status = queue.getStatus();
+
+        assertEquals(3, status.getQueueSize());
+        assertEquals(5, status.getActiveThreads());
+        assertEquals(10, status.getPoolSize());
+        assertEquals(1000, status.getQueueCapacity());
+        assertTrue(status.isRunning());
+    }
+
+    @Test
+    void testGetPriorityStatistics() throws Exception {
+        Field priorityStatsField = PriorityTaskQueue.class.getDeclaredField("priorityStats");
+        priorityStatsField.setAccessible(true);
+        ConcurrentHashMap<TaskPriority, AtomicLong> stats =
+            (ConcurrentHashMap<TaskPriority, AtomicLong>) priorityStatsField.get(queue);
+
+        stats.get(TaskPriority.HIGH).set(10L);
+        stats.get(TaskPriority.NORMAL).set(20L);
+
+        Map<TaskPriority, Long> result = queue.getPriorityStatistics();
+
+        assertEquals(10L, result.get(TaskPriority.HIGH));
+        assertEquals(20L, result.get(TaskPriority.NORMAL));
+    }
+
+    @Test
+    void testResizeThreadPool() {
+        queue.resizeThreadPool(5, 20);
+
+        verify(mockExecutor, times(1)).setCorePoolSize(5);
+        verify(mockExecutor, times(1)).setMaximumPoolSize(20);
+    }
+
+    @Test
+    void testClear() {
+        queue.clear();
+
+        verify(mockQueue, times(1)).clear();
+    }
+
+    @Test
+    void testShutdown() throws Exception {
+        Field runningField = PriorityTaskQueue.class.getDeclaredField("running");
+        runningField.setAccessible(true);
+        AtomicBoolean running = (AtomicBoolean) runningField.get(queue);
+        running.set(true);
+
+        Field consumerThreadField = PriorityTaskQueue.class.getDeclaredField("queueConsumerThread");
+        consumerThreadField.setAccessible(true);
+        Thread mockThread = mock(Thread.class);
+        when(mockThread.isAlive()).thenReturn(true);
+        consumerThreadField.set(queue, mockThread);
+
+        queue.shutdown();
+
+        assertFalse(running.get());
+        verify(mockExecutor, times(1)).shutdown();
+        verify(mockThread, times(1)).interrupt();
+    }
+
+    @Test
+    void testQueueStatusSuccessRate() {
+        PriorityTaskQueue.QueueStatus status = PriorityTaskQueue.QueueStatus.builder()
+                .totalProcessed(80L)
+                .totalFailed(20L)
+                .build();
+
+        assertEquals(80.0, status.getSuccessRate());
+
+        // 测试除零情况
+        status = PriorityTaskQueue.QueueStatus.builder()
+                .totalProcessed(0L)
+                .totalFailed(0L)
+                .build();
+
+        assertEquals(0.0, status.getSuccessRate());
+    }
+
+    @Test
+    void testQueueStatusQueueUsage() {
+        PriorityTaskQueue.QueueStatus status = PriorityTaskQueue.QueueStatus.builder()
+                .queueSize(500)
+                .queueCapacity(1000)
+                .build();
+
+        assertEquals(50.0, status.getQueueUsage());
+
+        status = PriorityTaskQueue.QueueStatus.builder()
+                .queueSize(0)
+                .queueCapacity(1000)
+                .build();
+
+        assertEquals(0.0, status.getQueueUsage());
+    }
+}
+7.6 AsyncTaskExecutorTest.java
+java
+下载
+复制
+package com.example.asyncqueue.service;
+
+import com.example.asyncqueue.core.evaluator.PriorityEvaluator;
+import com.example.asyncqueue.core.queue.PriorityTaskQueue;
+import com.example.asyncqueue.core.task.TaskPriority;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AsyncTaskExecutorTest {
+
+    @Mock
+    private PriorityTaskQueue mockQueue;
+
+    @Mock
+    private PriorityEvaluator mockEvaluator;
+
+    private AsyncTaskExecutor executor;
+
+    @BeforeEach
+    void setUp() {
+        executor = new AsyncTaskExecutor(mockQueue, mockEvaluator);
+    }
+
+    @Test
+    void testSubmitTask() {
+        String taskName = "test-task";
+        Runnable task = () -> System.out.println("Test");
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("key", "value");
+
+        when(mockEvaluator.evaluateDefault(metadata)).thenReturn(TaskPriority.NORMAL);
+
+        String taskId = executor.submitTask(taskName, task, metadata);
+
+        assertNotNull(taskId);
+        assertTrue(taskId.startsWith("TASK-"));
+
+        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        ArgumentCaptor<TaskPriority> priorityCaptor = ArgumentCaptor.forClass(TaskPriority.class);
+        ArgumentCaptor<Map<String, Object>> metadataCaptor = ArgumentCaptor.forClass(Map.class);
+
+        verify(mockQueue, times(1)).submit(
+            taskCaptor.capture(),
+            priorityCaptor.capture(),
+            metadataCaptor.capture()
+        );
+
+        assertEquals(TaskPriority.NORMAL, priorityCaptor.getValue());
+        assertEquals(metadata, metadataCaptor.getValue());
+    }
+
+    @Test
+    void testSubmitTaskWithPriority() {
+        String taskName = "test-task";
+        Runnable task = () -> System.out.println("Test");
+        TaskPriority priority = TaskPriority.HIGH;
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("key", "value");
+
+        String taskId = executor.submitTask(taskName, task, priority, metadata);
+
+        assertNotNull(taskId);
+        assertTrue(taskId.startsWith("TASK-"));
+
+        verify(mockQueue, times(1)).submit(any(Runnable.class), eq(priority), eq(metadata));
+    }
+
+    @Test
+    void testSubmitDelayedTask() throws InterruptedException {
+        String taskName = "delayed-task";
+        Runnable task = () -> System.out.println("Delayed");
+        Map<String, Object> metadata = new HashMap<>();
+
+        String taskId = executor.submitDelayedTask(taskName, task, 100, TimeUnit.MILLISECONDS, metadata);
+
+        assertNotNull(taskId);
+        assertTrue(taskId.startsWith("DELAYED-"));
+
+        // 等待任务执行
+        Thread.sleep(150);
+
+        verify(mockQueue, timeout(200)).submit(any(Runnable.class), any(TaskPriority.class), eq(metadata));
+    }
+
+    @Test
+    void testSubmitBatch() {
+        String batchName = "test-batch";
+        Map<String, Runnable> tasks = new ConcurrentHashMap<>();
+        tasks.put("task1", () -> System.out.println("Task 1"));
+        tasks.put("task2", () -> System.out.println("Task 2"));
+        tasks.put("task3", () -> System.out.println("Task 3"));
+
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("batch", true);
+
+        when(mockEvaluator.evaluateDefault(any())).thenReturn(TaskPriority.NORMAL);
+
+        executor.submitBatch(batchName, tasks, metadata);
+
+        verify(mockQueue, times(3)).submit(any(Runnable.class), any(TaskPriority.class), any(Map.class));
+    }
+
+    @Test
+    void testGetStats() {
+        PriorityTaskQueue.QueueStatus queueStatus = PriorityTaskQueue.QueueStatus.builder()
+                .totalSubmitted(100L)
+                .totalProcessed(80L)
+                .totalFailed(20L)
+                .queueSize(5)
+                .activeThreads(3)
+                .queueCapacity(1000)
+                .isRunning(true)
+                .build();
+
+        when(mockQueue.getStatus()).thenReturn(queueStatus);
+
+        AsyncTaskExecutor.ExecutionStats stats = executor.getStats();
+
+        assertEquals(100L, stats.getTotalSubmitted());
+        assertEquals(80L, stats.getTotalProcessed());
+        assertEquals(20L, stats.getTotalFailed());
+        assertEquals(80.0, stats.getSuccessRate());
+        assertEquals(5, stats.getQueueSize());
+        assertEquals(3, stats.getActiveThreads());
+        assertNotNull(stats.getTimestamp());
+    }
+
+    @Test
+    void testAddRemoveListener() {
+        AsyncTaskExecutor.TaskListener listener = new AsyncTaskExecutor.TaskListener() {
+            @Override
+            public void beforeExecute(com.example.asyncqueue.core.task.AsyncTask task) {}
+
+            @Override
+            public void onSuccess(com.example.asyncqueue.core.task.AsyncTask task) {}
+
+            @Override
+            public void onFailure(com.example.asyncqueue.core.task.AsyncTask task, Exception e) {}
+        };
+
+        executor.addListener(listener);
+        executor.removeListener(listener);
+
+        // 验证监听器可以成功添加和移除
+        assertEquals(0, executor.getActiveTaskCount());
+    }
+
+    @Test
+    void testCleanup() {
+        executor.cleanup();
+        // 验证清理方法不会抛出异常
+        assertDoesNotThrow(() -> executor.cleanup());
+    }
+}
+7.7 AsyncTaskControllerTest.java
+java
+下载
+复制
+package com.example.asyncqueue.controller;
+
+import com.example.asyncqueue.service.AsyncTaskExecutor;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.ResponseEntity;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AsyncTaskControllerTest {
+
+    @Mock
+    private AsyncTaskExecutor mockExecutor;
+
+    @InjectMocks
+    private AsyncTaskController controller;
+
+    @BeforeEach
+    void setUp() {
+        when(mockExecutor.submitTask(anyString(), any(Runnable.class), anyMap()))
+            .thenReturn("test-task-id-123");
+    }
+
+    @Test
+    void testSubmitTask() {
+        ResponseEntity<Map<String, Object>> response = controller.submitTask(
+            "test-task", 2, null
+        );
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertTrue((Boolean) body.get("success"));
+        assertEquals("任务提交成功", body.get("message"));
+        assertEquals("test-task-id-123", body.get("taskId"));
+        assertEquals("test-task", body.get("taskName"));
+
+        verify(mockExecutor, times(1)).submitTask(
+            eq("test-task"), any(Runnable.class), anyMap()
+        );
+    }
+
+    @Test
+    void testSubmitTaskWithPriority() {
+        when(mockExecutor.submitTask(anyString(), any(Runnable.class),
+            any(com.example.asyncqueue.core.task.TaskPriority.class), anyMap()))
+            .thenReturn("priority-task-id-123");
+
+        ResponseEntity<Map<String, Object>> response = controller.submitTaskWithPriority(
+            "test-task", com.example.asyncqueue.core.task.TaskPriority.HIGH, 3, null
+        );
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertEquals(com.example.asyncqueue.core.task.TaskPriority.HIGH, body.get("priority"));
+
+        verify(mockExecutor, times(1)).submitTask(
+            eq("test-task"), any(Runnable.class),
+            eq(com.example.asyncqueue.core.task.TaskPriority.HIGH), anyMap()
+        );
+    }
+
+    @Test
+    void testSubmitDelayedTask() {
+        when(mockExecutor.submitDelayedTask(anyString(), any(Runnable.class),
+            anyLong(), any(TimeUnit.class), anyMap()))
+            .thenReturn("delayed-task-id-123");
+
+        ResponseEntity<Map<String, Object>> response = controller.submitDelayedTask(
+            "delayed-task", 5000L, TimeUnit.MILLISECONDS, null
+        );
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertEquals("延迟任务提交成功", body.get("message"));
+        assertEquals(5000L, body.get("delay"));
+        assertEquals(TimeUnit.MILLISECONDS, body.get("unit"));
+
+        verify(mockExecutor, times(1)).submitDelayedTask(
+            eq("delayed-task"), any(Runnable.class),
+            eq(5000L), eq(TimeUnit.MILLISECONDS), anyMap()
+        );
+    }
+
+    @Test
+    void testSubmitPeriodicTask() {
+        when(mockExecutor.submitPeriodicTask(anyString(), any(Runnable.class),
+            anyLong(), anyLong(), any(TimeUnit.class), anyMap()))
+            .thenReturn("periodic-task-id-123");
+
+        ResponseEntity<Map<String, Object>> response = controller.submitPeriodicTask(
+            "periodic-task", 0L, 60L, TimeUnit.SECONDS, null
+        );
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertEquals("周期性任务提交成功", body.get("message"));
+        assertEquals(0L, body.get("initialDelay"));
+        assertEquals(60L, body.get("period"));
+        assertEquals(TimeUnit.SECONDS, body.get("unit"));
+
+        verify(mockExecutor, times(1)).submitPeriodicTask(
+            eq("periodic-task"), any(Runnable.class),
+            eq(0L), eq(60L), eq(TimeUnit.SECONDS), anyMap()
+        );
+    }
+
+    @Test
+    void testSubmitBatch() {
+        ResponseEntity<Map<String, Object>> response = controller.submitBatch(
+            "test-batch", 5, null
+        );
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertEquals("批量任务提交成功", body.get("message"));
+        assertEquals("test-batch", body.get("batchName"));
+        assertEquals(5, body.get("taskCount"));
+
+        verify(mockExecutor, times(1)).submitBatch(
+            eq("test-batch"), anyMap(), anyMap()
+        );
+    }
+
+    @Test
+    void testGetStats() {
+        AsyncTaskExecutor.ExecutionStats mockStats = AsyncTaskExecutor.ExecutionStats.builder()
+            .totalSubmitted(100L)
+            .totalProcessed(80L)
+            .totalFailed(20L)
+            .successRate(80.0)
+            .queueSize(5)
+            .activeThreads(3)
+            .trackedTasks(2)
+            .build();
+
+        when(mockExecutor.getStats()).thenReturn(mockStats);
+
+        ResponseEntity<Map<String, Object>> response = controller.getStats();
+
+        assertEquals(200, response.getStatusCodeValue());
+        Map<String, Object> body = response.getBody();
+
+        assertNotNull(body);
+        assertTrue((Boolean) body.get("success"));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> stats = (Map<String, Object>) body.get("stats");
+
+        assertNotNull(stats);
+        assertEquals(100L, stats.get("totalSubmitted"));
+        assertEquals(
