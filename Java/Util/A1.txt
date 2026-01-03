@@ -1,0 +1,732 @@
+我来帮你创建一个功能强大的测试文件生成工具类，支持多种格式和大小的文件。
+
+java
+下载
+复制
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.Random;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+/**
+ * 测试文件生成工具类
+ * 支持生成各种格式、大小的测试文件
+ */
+public class TestFileGenerator {
+
+    private static final Random random = new Random();
+    private static final String DEFAULT_TEXT =
+        "这是一个测试文件内容。This is a test file content.\n" +
+        "用于软件测试和性能验证。For software testing and performance verification.\n" +
+        "可以生成指定大小的文件。Can generate files of specified size.\n" +
+        "支持多种格式：txt, csv, json, xml, log, bin, zip。\n" +
+        "Support multiple formats: txt, csv, json, xml, log, bin, zip.\n";
+
+    /**
+     * 文件大小单位枚举
+     */
+    public enum SizeUnit {
+        BYTES,      // 字节
+        KB,         // 千字节
+        MB,         // 兆字节
+        GB          // 吉字节
+    }
+
+    /**
+     * 生成指定大小的文本文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateTextFile(String filePath, long size, SizeUnit unit) throws IOException {
+        return generateTextFile(filePath, size, unit, DEFAULT_TEXT);
+    }
+
+    /**
+     * 生成指定大小的文本文件（自定义内容模板）
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @param contentTemplate 内容模板
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateTextFile(String filePath, long size, SizeUnit unit,
+                                        String contentTemplate) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+
+            long currentSize = 0;
+            byte[] templateBytes = contentTemplate.getBytes(StandardCharsets.UTF_8);
+
+            // 先写入完整的内容模板
+            if (templateBytes.length > 0) {
+                while (currentSize + templateBytes.length <= targetSize) {
+                    writer.write(contentTemplate);
+                    currentSize += templateBytes.length;
+                }
+            }
+
+            // 填充剩余空间
+            if (currentSize < targetSize) {
+                String remainingContent = getRandomText((int)(targetSize - currentSize));
+                writer.write(remainingContent);
+            }
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成二进制文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateBinaryFile(String filePath, long size, SizeUnit unit) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (FileOutputStream fos = new FileOutputStream(file);
+             BufferedOutputStream bos = new BufferedOutputStream(fos)) {
+
+            byte[] buffer = new byte[8192];
+            long bytesWritten = 0;
+
+            while (bytesWritten < targetSize) {
+                int bytesToWrite = (int) Math.min(buffer.length, targetSize - bytesWritten);
+                random.nextBytes(buffer);
+                bos.write(buffer, 0, bytesToWrite);
+                bytesWritten += bytesToWrite;
+            }
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成CSV文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @param withHeader 是否包含表头
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateCsvFile(String filePath, long size, SizeUnit unit,
+                                      boolean withHeader) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+
+            // 写入表头
+            if (withHeader) {
+                String header = "ID,Name,Email,Age,Salary,Department,JoinDate,IsActive\n";
+                writer.write(header);
+            }
+
+            long currentSize = withHeader ? "ID,Name,Email,Age,Salary,Department,JoinDate,IsActive\n"
+                    .getBytes(StandardCharsets.UTF_8).length : 0;
+
+            // 生成数据行
+            while (currentSize < targetSize) {
+                String row = generateCsvRow();
+                byte[] rowBytes = row.getBytes(StandardCharsets.UTF_8);
+
+                if (currentSize + rowBytes.length > targetSize) {
+                    // 如果写入这一行会超过目标大小，则写入部分内容
+                    int remainingBytes = (int)(targetSize - currentSize);
+                    if (remainingBytes > 0) {
+                        writer.write(row.substring(0, remainingBytes));
+                    }
+                    break;
+                }
+
+                writer.write(row);
+                currentSize += rowBytes.length;
+            }
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成JSON文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @param isArray 是否为JSON数组格式
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateJsonFile(String filePath, long size, SizeUnit unit,
+                                       boolean isArray) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+
+            if (isArray) {
+                writer.write("[\n");
+                long currentSize = 2; // "[\n" 的字节数
+                boolean firstItem = true;
+
+                while (currentSize < targetSize) {
+                    if (!firstItem) {
+                        writer.write(",\n");
+                        currentSize += 2;
+                    }
+
+                    String jsonObject = generateJsonObject();
+                    byte[] objectBytes = jsonObject.getBytes(StandardCharsets.UTF_8);
+
+                    if (currentSize + objectBytes.length + 1 > targetSize) { // +1 for closing bracket
+                        break;
+                    }
+
+                    writer.write(jsonObject);
+                    currentSize += objectBytes.length;
+                    firstItem = false;
+                }
+
+                writer.write("\n]");
+            } else {
+                // 单个JSON对象
+                String jsonObject = generateLargeJsonObject(targetSize);
+                writer.write(jsonObject);
+            }
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成XML文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateXmlFile(String filePath, long size, SizeUnit unit) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+
+            String xmlHeader = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+            String rootStart = "<data>\n";
+            String rootEnd = "</data>\n";
+
+            writer.write(xmlHeader);
+            writer.write(rootStart);
+
+            long currentSize = xmlHeader.getBytes(StandardCharsets.UTF_8).length +
+                             rootStart.getBytes(StandardCharsets.UTF_8).length;
+
+            while (currentSize + rootEnd.getBytes(StandardCharsets.UTF_8).length < targetSize) {
+                String record = generateXmlRecord();
+                byte[] recordBytes = record.getBytes(StandardCharsets.UTF_8);
+
+                if (currentSize + recordBytes.length + rootEnd.getBytes(StandardCharsets.UTF_8).length > targetSize) {
+                    break;
+                }
+
+                writer.write(record);
+                currentSize += recordBytes.length;
+            }
+
+            writer.write(rootEnd);
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成日志文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateLogFile(String filePath, long size, SizeUnit unit) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+
+            long currentSize = 0;
+
+            while (currentSize < targetSize) {
+                String logEntry = generateLogEntry();
+                byte[] logBytes = logEntry.getBytes(StandardCharsets.UTF_8);
+
+                if (currentSize + logBytes.length > targetSize) {
+                    int remainingBytes = (int)(targetSize - currentSize);
+                    if (remainingBytes > 0) {
+                        writer.write(logEntry.substring(0, remainingBytes));
+                    }
+                    break;
+                }
+
+                writer.write(logEntry);
+                currentSize += logBytes.length;
+            }
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成ZIP压缩文件（包含多个测试文件）
+     *
+     * @param filePath ZIP文件路径
+     * @param totalSize 总大小
+     * @param unit 大小单位
+     * @param fileCount 包含的文件数量
+     * @return 生成的ZIP文件
+     * @throws IOException
+     */
+    public static File generateZipFile(String filePath, long totalSize, SizeUnit unit,
+                                      int fileCount) throws IOException {
+        long targetSize = convertToBytes(totalSize, unit);
+        long maxFileSize = targetSize / fileCount;
+
+        File zipFile = new File(filePath);
+        File tempDir = Files.createTempDirectory("testfiles_").toFile();
+
+        try (FileOutputStream fos = new FileOutputStream(zipFile);
+             ZipOutputStream zos = new ZipOutputStream(fos)) {
+
+            long currentZipSize = 0;
+
+            for (int i = 0; i < fileCount && currentZipSize < targetSize; i++) {
+                // 创建临时文件
+                String fileName = "testfile_" + (i + 1) + getRandomExtension();
+                File tempFile = new File(tempDir, fileName);
+
+                // 生成文件内容
+                long fileSize = Math.min(maxFileSize, targetSize - currentZipSize);
+                if (fileSize > 0) {
+                    generateBinaryFile(tempFile.getAbsolutePath(), fileSize, SizeUnit.BYTES);
+
+                    // 添加到ZIP
+                    try (FileInputStream fis = new FileInputStream(tempFile)) {
+                        ZipEntry zipEntry = new ZipEntry(fileName);
+                        zos.putNextEntry(zipEntry);
+
+                        byte[] buffer = new byte[8192];
+                        int len;
+                        while ((len = fis.read(buffer)) > 0) {
+                            zos.write(buffer, 0, len);
+                            currentZipSize += len;
+                        }
+
+                        zos.closeEntry();
+                    }
+
+                    // 删除临时文件
+                    tempFile.delete();
+                }
+            }
+        }
+
+        // 删除临时目录
+        deleteDirectory(tempDir);
+
+        return zipFile;
+    }
+
+    /**
+     * 快速生成指定大小的空文件
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateEmptyFile(String filePath, long size, SizeUnit unit) throws IOException {
+        long targetSize = convertToBytes(size, unit);
+        File file = new File(filePath);
+
+        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            raf.setLength(targetSize);
+        }
+
+        return file;
+    }
+
+    /**
+     * 生成指定大小的文件（自动根据扩展名选择格式）
+     *
+     * @param filePath 文件路径
+     * @param size 文件大小
+     * @param unit 大小单位
+     * @return 生成的文件
+     * @throws IOException
+     */
+    public static File generateFile(String filePath, long size, SizeUnit unit) throws IOException {
+        File file = new File(filePath);
+        String fileName = file.getName().toLowerCase();
+
+        if (fileName.endsWith(".txt")) {
+            return generateTextFile(filePath, size, unit);
+        } else if (fileName.endsWith(".csv")) {
+            return generateCsvFile(filePath, size, unit, true);
+        } else if (fileName.endsWith(".json")) {
+            return generateJsonFile(filePath, size, unit, true);
+        } else if (fileName.endsWith(".xml")) {
+            return generateXmlFile(filePath, size, unit);
+        } else if (fileName.endsWith(".log")) {
+            return generateLogFile(filePath, size, unit);
+        } else if (fileName.endsWith(".zip")) {
+            return generateZipFile(filePath, size, unit, 5);
+        } else {
+            return generateBinaryFile(filePath, size, unit);
+        }
+    }
+
+    // 辅助方法
+
+    private static long convertToBytes(long size, SizeUnit unit) {
+        switch (unit) {
+            case KB:
+                return size * 1024;
+            case MB:
+                return size * 1024 * 1024;
+            case GB:
+                return size * 1024 * 1024 * 1024;
+            default:
+                return size;
+        }
+    }
+
+    private static String getRandomText(int length) {
+        StringBuilder sb = new StringBuilder(length);
+        String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" +
+                      "这是一段中文测试文本，用于生成随机文本内容。";
+
+        for (int i = 0; i < length; i++) {
+            sb.append(chars.charAt(random.nextInt(chars.length())));
+        }
+
+        return sb.toString();
+    }
+
+    private static String generateCsvRow() {
+        int id = random.nextInt(1000000);
+        String name = "User" + id;
+        String email = "user" + id + "@example.com";
+        int age = 20 + random.nextInt(50);
+        double salary = 5000 + random.nextDouble() * 50000;
+        String department = getRandomDepartment();
+        String joinDate = String.format("202%d-%02d-%02d",
+            random.nextInt(5),
+            1 + random.nextInt(12),
+            1 + random.nextInt(28));
+        boolean isActive = random.nextBoolean();
+
+        return String.format("%d,%s,%s,%d,%.2f,%s,%s,%s\n",
+            id, name, email, age, salary, department, joinDate, isActive);
+    }
+
+    private static String getRandomDepartment() {
+        String[] departments = {"IT", "HR", "Finance", "Sales", "Marketing", "Engineering", "Support"};
+        return departments[random.nextInt(departments.length)];
+    }
+
+    private static String generateJsonObject() {
+        int id = random.nextInt(1000000);
+        String name = "User" + id;
+        String email = "user" + id + "@example.com";
+        int age = 20 + random.nextInt(50);
+        double salary = 5000 + random.nextDouble() * 50000;
+        String department = getRandomDepartment();
+        String joinDate = String.format("202%d-%02d-%02d",
+            random.nextInt(5),
+            1 + random.nextInt(12),
+            1 + random.nextInt(28));
+        boolean isActive = random.nextBoolean();
+
+        return String.format(
+            "  {\n" +
+            "    \"id\": %d,\n" +
+            "    \"name\": \"%s\",\n" +
+            "    \"email\": \"%s\",\n" +
+            "    \"age\": %d,\n" +
+            "    \"salary\": %.2f,\n" +
+            "    \"department\": \"%s\",\n" +
+            "    \"joinDate\": \"%s\",\n" +
+            "    \"isActive\": %s\n" +
+            "  }", id, name, email, age, salary, department, joinDate, isActive);
+    }
+
+    private static String generateLargeJsonObject(long targetSize) {
+        StringBuilder sb = new StringBuilder((int) Math.min(targetSize, Integer.MAX_VALUE));
+        sb.append("{\n");
+        sb.append("  \"description\": \"这是一个大型JSON测试文件\",\n");
+        sb.append("  \"generatedAt\": \"");
+        sb.append(java.time.LocalDateTime.now());
+        sb.append("\",\n");
+        sb.append("  \"items\": [\n");
+
+        long currentSize = sb.length();
+        boolean firstItem = true;
+
+        while (currentSize < targetSize - 100) { // 预留结尾部分的空间
+            if (!firstItem) {
+                sb.append(",\n");
+                currentSize += 2;
+            }
+
+            String item = generateSimpleJsonItem();
+            if (currentSize + item.length() + 10 > targetSize) { // +10 for closing brackets
+                break;
+            }
+
+            sb.append(item);
+            currentSize += item.length();
+            firstItem = false;
+        }
+
+        sb.append("\n  ]\n}");
+        return sb.toString();
+    }
+
+    private static String generateSimpleJsonItem() {
+        int id = random.nextInt(1000);
+        return String.format(
+            "    {\"id\": %d, \"value\": \"Item%d\", \"timestamp\": %d}",
+            id, id, System.currentTimeMillis() - random.nextInt(1000000));
+    }
+
+    private static String generateXmlRecord() {
+        int id = random.nextInt(1000000);
+        String name = "User" + id;
+        String email = "user" + id + "@example.com";
+        int age = 20 + random.nextInt(50);
+        String department = getRandomDepartment();
+
+        return String.format(
+            "  <record>\n" +
+            "    <id>%d</id>\n" +
+            "    <name>%s</name>\n" +
+            "    <email>%s</email>\n" +
+            "    <age>%d</age>\n" +
+            "    <department>%s</department>\n" +
+            "  </record>\n", id, name, email, age, department);
+    }
+
+    private static String generateLogEntry() {
+        String[] levels = {"INFO", "DEBUG", "WARN", "ERROR"};
+        String[] classes = {
+            "com.example.TestClass",
+            "org.springframework.web.servlet.DispatcherServlet",
+            "com.example.service.UserService",
+            "com.example.controller.HomeController"
+        };
+
+        String level = levels[random.nextInt(levels.length)];
+        String clazz = classes[random.nextInt(classes.length)];
+        String timestamp = java.time.LocalDateTime.now()
+            .minusSeconds(random.nextInt(86400))
+            .toString();
+        String message = getRandomLogMessage(level);
+
+        return String.format("[%s] [%s] [%s] - %s\n",
+            timestamp, level, clazz, message);
+    }
+
+    private static String getRandomLogMessage(String level) {
+        switch (level) {
+            case "INFO":
+                return "Processing request " + random.nextInt(10000);
+            case "DEBUG":
+                return "Entering method processData with param: " + random.nextInt(100);
+            case "WARN":
+                return "Resource usage is high: " + (80 + random.nextInt(20)) + "%";
+            case "ERROR":
+                return "Failed to process request: " + random.nextInt(10000) +
+                       ", exception: NullPointerException";
+            default:
+                return "Log message";
+        }
+    }
+
+    private static String getRandomExtension() {
+        String[] extensions = {".txt", ".log", ".dat", ".bin", ".tmp", ".data"};
+        return extensions[random.nextInt(extensions.length)];
+    }
+
+    private static void deleteDirectory(File dir) {
+        if (dir.exists()) {
+            File[] files = dir.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    if (file.isDirectory()) {
+                        deleteDirectory(file);
+                    } else {
+                        file.delete();
+                    }
+                }
+            }
+            dir.delete();
+        }
+    }
+}
+
+接下来是使用示例：
+
+java
+下载
+复制
+import java.io.File;
+import java.io.IOException;
+
+/**
+ * 测试文件生成工具使用示例
+ */
+public class TestFileGeneratorExample {
+
+    public static void main(String[] args) {
+        try {
+            // 创建输出目录
+            File outputDir = new File("test_files");
+            if (!outputDir.exists()) {
+                outputDir.mkdirs();
+            }
+
+            System.out.println("开始生成测试文件...");
+
+            // 示例1: 生成1MB的文本文件
+            File txtFile = TestFileGenerator.generateTextFile(
+                "test_files/sample.txt", 1, TestFileGenerator.SizeUnit.MB);
+            System.out.println("已生成: " + txtFile.getAbsolutePath() +
+                             " 大小: " + txtFile.length() + " bytes");
+
+            // 示例2: 生成500KB的CSV文件
+            File csvFile = TestFileGenerator.generateCsvFile(
+                "test_files/data.csv", 500, TestFileGenerator.SizeUnit.KB, true);
+            System.out.println("已生成: " + csvFile.getAbsolutePath() +
+                             " 大小: " + csvFile.length() + " bytes");
+
+            // 示例3: 生成2MB的JSON文件
+            File jsonFile = TestFileGenerator.generateJsonFile(
+                "test_files/data.json", 2, TestFileGenerator.SizeUnit.MB, true);
+            System.out.println("已生成: " + jsonFile.getAbsolutePath() +
+                             " 大小: " + jsonFile.length() + " bytes");
+
+            // 示例4: 生成1MB的XML文件
+            File xmlFile = TestFileGenerator.generateXmlFile(
+                "test_files/data.xml", 1, TestFileGenerator.SizeUnit.MB);
+            System.out.println("已生成: " + xmlFile.getAbsolutePath() +
+                             " 大小: " + xmlFile.length() + " bytes");
+
+            // 示例5: 生成5MB的二进制文件
+            File binFile = TestFileGenerator.generateBinaryFile(
+                "test_files/data.bin", 5, TestFileGenerator.SizeUnit.MB);
+            System.out.println("已生成: " + binFile.getAbsolutePath() +
+                             " 大小: " + binFile.length() + " bytes");
+
+            // 示例6: 生成1MB的日志文件
+            File logFile = TestFileGenerator.generateLogFile(
+                "test_files/app.log", 1, TestFileGenerator.SizeUnit.MB);
+            System.out.println("已生成: " + logFile.getAbsolutePath() +
+                             " 大小: " + logFile.length() + " bytes");
+
+            // 示例7: 生成10MB的ZIP文件（包含5个文件）
+            File zipFile = TestFileGenerator.generateZipFile(
+                "test_files/archive.zip", 10, TestFileGenerator.SizeUnit.MB, 5);
+            System.out.println("已生成: " + zipFile.getAbsolutePath() +
+                             " 大小: " + zipFile.length() + " bytes");
+
+            // 示例8: 生成100MB的空文件（快速）
+            File emptyFile = TestFileGenerator.generateEmptyFile(
+                "test_files/empty.bin", 100, TestFileGenerator.SizeUnit.MB);
+            System.out.println("已生成: " + emptyFile.getAbsolutePath() +
+                             " 大小: " + emptyFile.length() + " bytes");
+
+            // 示例9: 根据扩展名自动选择格式
+            File autoFile = TestFileGenerator.generateFile(
+                "test_files/auto.csv", 300, TestFileGenerator.SizeUnit.KB);
+            System.out.println("已生成: " + autoFile.getAbsolutePath() +
+                             " 大小: " + autoFile.length() + " bytes");
+
+            System.out.println("\n所有测试文件生成完成！");
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+这个工具类提供了以下功能：
+
+主要特性：
+
+支持多种文件格式：文本、CSV、JSON、XML、日志、二进制、ZIP
+
+支持指定文件大小（字节、KB、MB、GB）
+
+自动根据文件扩展名选择生成格式
+
+生成真实的数据内容，不仅仅是随机字节
+
+支持生成压缩文件包
+
+使用方法：
+
+基本使用：generateTextFile(path, size, unit)
+
+自定义内容：generateTextFile(path, size, unit, customTemplate)
+
+根据扩展名自动选择：generateFile(path, size, unit)
+
+生成的文件类型：
+
+文本文件：包含中英文混合内容
+
+CSV文件：包含表头和模拟的业务数据
+
+JSON文件：结构化的JSON对象或数组
+
+XML文件：格式良好的XML文档
+
+日志文件：模拟应用日志格式
+
+二进制文件：随机字节数据
+
+ZIP文件：包含多个测试文件的压缩包
+
+注意事项：
+
+生成大文件（GB级别）时注意磁盘空间
+
+生成文件前确保有写入权限
+
+二进制文件和ZIP文件可能包含随机数据
+
+可以根据需要调整生成的数据模板
