@@ -1,0 +1,320 @@
+Karat（karat.com）平台介绍
+Karat 是面向企业的技术人才评估与招聘外包服务商（人才提升合作伙伴），主打Interviewing Cloud 面试云，聚焦工程师技术面试，适配人机协同（Human+AI）时代，帮企业解决技术招聘标准不统一、占用内部工程师大量时间、AI 能力测评难的痛点。简单说：企业把工程师的技术面试外包给 Karat，由它的专业面试工程师完成评估，并输出人才数据分析报告。
+核心业务
+直接招聘（Direct Hiring）：全球标准化筛选技术人才，替企业完成技术面试环节。
+合作人才评估（Partner Talent）：评估外包人员、IT 服务商的工程师，确保外包人员能力匹配企业标准。
+AI 就绪度评估（AI Readiness）：测评在职、候选工程师使用 AI 工具工作的实际能力，采用真实 AI 实战场景考核。
+多元化人才项目 Brilliant Black Minds：为黑人软件工程师提供免费模拟技术面试，丰富企业人才管道，促进招聘公平。
+完整工作流程四步
+设定统一标准：和企业一起定义工程师能力标准，确定招聘门槛。
+专业人才测评：Karat 专属面试工程师，用统一流程评估候选人，保证数据可对比。
+全球人才质量对标：依托超过 60 万次技术面试数据库，把企业人才和行业基准对比。
+数据驱动决策：面试数据用于正式招聘、外包人员上岗、项目人员分配决策。
+平台主要特点
+统一、标准化的技术面试
+由 Karat 专业的 Interview Engineer（面试工程师）执行面试，不受团队、地域、外包供应商差异影响，所有候选人执行同一套严格考核标准，消除不同面试官带来的主观偏差。企业内部工程师不用花大量时间做初筛面试，释放研发人力投入产品开发。
+海量数据与行业对标能力
+积累60 万 + 场技术面试数据，给企业提供人才洞察、市场基准对比，企业能看清自身工程师、外包人员在行业中的水平。输出可横向对比的客观评估结果，不是模糊主观评价。
+支持 AI 时代工程师测评
+提供真实的 AI 原生实战场景与专业方法论，评估工程师和 AI 协同工作的能力，不需要消耗企业内部团队精力，专门应对当下 AI 工具普及后的人才考核需求。
+产品覆盖全职 + 外包人才
+不仅招正式员工，还可以评估承包商、IT 服务商外派人员，给外包人员做能力把关，给企业提供人才质量保障。
+多元化公益项目
+Brilliant Black Minds 项目，为科技行业少数群体工程师提供免费模拟面试，拓展企业多元化人才池。
+客户群体
+服务大量大型企业（Mastercard、Deliveroo、EA、Compass 等），客户反馈：可以加快招聘进度、节省工程师工时、统一招聘口径。
+交付成果
+输出标准化面试反馈、人才质量数据报告、跨地域 / 岗位对标分析，支撑企业招聘决策、外包准入、团队人员优化，让每一份人才预算产出更高价值。
+简单总结：Karat 就是企业的 “外部技术面试中心”，把工程师技术面试外包 + 数据化评估，同时新增 AI 协同能力测评，解决企业招人、管外包、评估员工 AI 能力的问题。
+
+
+Karat 完整面试流程（企业侧 + 候选人侧）
+Karat 本质：第三方外包技术初筛，面试官是 Karat 受训的 Interview Engineer，不是目标公司内部员工；全程录屏、编码留痕，输出标准化打分报告给企业，企业再做最终判断。
+主流面试类型：Karat Core（45‑60 分钟完整技术面试）；Karat Focus（短版本，单能力点评估）karat.slab...。
+一、企业方前置准备（面试前）
+对齐岗位标准
+企业和 Karat 共同定义岗位能力、招聘门槛、评分标准 rubric，选定题库（算法、系统设计、AI 协同能力等），确定面试版本（Core / Focus / AI‑Readiness）Karat。
+候选人导入
+通过 Karat 平台、API、ATS 系统（Jobvite 等）导入候选人，批量发起面试邀请customer-o...。
+Karat 分配面试工程师
+Interview Engineer 均具备 3 年以上开发经验，经过 Karat 完整培训、学徒考核，严格使用企业给定的评分标尺执行面试，不随意发挥题目Karat。
+二、候选人视角完整流程
+1）预约阶段
+候选人收到邮件邀请，自主选择时间，支持夜间、周末时段，可短信 / 邮件提醒，可提前 24h 改期Karat。
+面试前访问准备页面：做音视频检测，体验内置在线编码 IDE，查看岗位背景信息Karat。
+2）正式面试（Karat Core 标准 60 分钟，浏览器内完成，视频 + 在线编码环境）
+表格
+时间段	内容说明
+0‑5min	开场：面试官自我介绍，流程说明，确认音视频，候选人简单自我介绍
+5‑15min	基础技术摸底：语言、计算机基础、业务背景，少量行为问题
+15‑55min	核心技术环节（占大头）
+初级：算法编码题 1‑2 道，边写代码边口述思路
+中高级：编码 + 系统设计、架构权衡、故障排查；AI 评估赛道会加入 AI 工具协同实战场景
+支持 Python/Java/JS/C++ 等主流语言；IDE 在线写、运行、调试代码；全程录屏录像
+55‑60min	候选人提问环节，面试结束
+关键特点：高度标准化，面试官严格按照 rubric 打分，不会像公司内部面试官一样随意闲聊、给暗示；思考过程、沟通表达同样占分，不只看代码结果。
+3）面试结束后
+面试工程师当场完成打分，填写结构化评估报告；平台保存完整录像、全部代码记录。
+状态流转：Interview Pending（处理中）→Ready to Review（已交付企业）karat.slab...。
+三、企业接收结果环节
+企业登录 Karat 平台 / ATS，拿到三类交付物：
+结构化打分报告：分项得分、总分、和企业预设招聘门槛对比、Karat 给出的推荐（通过 / 不通过）customer-o...。
+完整面试回放视频 + 全部编码源码，企业内部工程师可以异步回看，不用亲自到场面试。
+完整性校验：包含防作弊检测标记（屏幕录制、代码溯源）。
+重要：Karat 只做评估，不做最终录用决策；是否进入下一轮，由企业自己决定。
+四、两种特色面试模式
+Karat Focus：短面试，仅考察单一能力点，时长更短，适合大批量候选人粗筛，成本更低karat.slab...。
+AI Readiness 评估：专门考察工程师如何使用 AI 编码工具完成任务，真实业务场景，评估工程师 AI 协同工作能力。
+五、流程关键特点总结
+面试官不属于目标公司，是 Karat 训练的外部工程师，严格遵循企业提供的评分标尺。
+全流程录屏留痕，企业异步回看，节省内部工程师时间。
+输出可横向对比的量化分数，方便批量对比大量候选人。
+候选人自主预约，时间灵活，支持夜间周末。
+
+Karat 面试｜候选人准备建议（英语沟通 + Java 技术栈）
+背景：Karat 是第三方标准化技术面试，面试官是 Karat 签约外部工程师，不是目标公司员工；全程英文对话，在线 IDE 写 Java；打分严格按照 Rubric 评分表，代码结果、解题思路表达、英文沟通、调试能力全部计分，不是只看最终 AC。
+面试时长：标准 Core 面试约 60 分钟。
+一、面试前环境 & 工具准备（必做）
+网络与设备
+使用电脑浏览器，不要手机；网络稳定，摄像头、麦克风必须可用，面试前平台自带音视频检测，一定要跑一遍。
+安静无干扰环境，关闭弹窗、通知；允许浏览器权限：摄像头、麦克风、网页 IDE 权限。
+Karat 内置在线编码 IDE，不需要本地 IDEA，直接网页写 Java，提前熟悉网页 IDE 操作：运行、debug、打印输出、导入基础类。
+⚠️注意：部分在线 IDE 对 Java 高级语法、第三方库有限制，只能使用 JDK 原生标准库，不要假设可以导入外部依赖。
+英语沟通前置准备
+全程口语英文，技术问题、思路讲解全部英文。
+不用地道母语级流利，但逻辑清晰、敢于开口讲思路最重要；卡顿可以说：Let me think for a second / Let me re‑phrase that。
+提前背熟高频技术英文术语：array, list, hashmap, recursion, time complexity, space complexity, edge case, null pointer exception, thread, heap, stack 等 Java 高频词汇。
+练习：边写代码，边用英文口述你的思考流程，Karat 非常看重 “思考过程”，闷头不说话会扣分。
+二、Java 技术重点准备范围（Karat 高频考点）
+Karat 初级‑中级岗位：算法编码为主；中高级岗位：编码 + Java 核心 + 简单系统设计。
+1）算法编码（占面试最大比重）
+重点刷经典中等难度算法，用 Java 实现：
+数组、字符串、哈希表（HashMap/HashSet）
+双指针、滑动窗口
+链表操作
+递归、DFS/BFS
+排序、二分查找
+时间、空间复杂度分析（必须会用英文解释复杂度）
+✅写代码习惯（Karat 非常看重）
+先沟通清楚题目，确认输入输出、边界 case，再动手写代码，不要上来直接写。
+主动说出 edge case：null 输入、空集合、重复元素、越界。
+Java 编码注意：空指针NullPointerException，集合判空，泛型处理。
+写完不能直接认为正确：主动模拟测试用例，口头跑一遍逻辑；遇到报错，用英文描述调试过程。
+2）Java 基础高频考题（英文问答）
+OOP 面向对象：inheritance、polymorphism、encapsulation、abstraction
+HashMap底层原理，hash 冲突
+ArrayList vs LinkedList 区别
+String、StringBuilder、StringBuffer
+Exception：checked vs unchecked exception
+JVM 简单概念：Heap / Stack，GC 简单概念
+访问修饰符 public /private/protected /default
+中高级会追加：多线程基础、synchronized，简单集合并发问题。
+3）系统设计（仅中高级岗位会出现）
+不会考超大分布式架构，偏向中等模块设计；需要用英文讲清楚模块、数据模型，权衡 trade‑off。
+4）AI Readiness 专项（如果你的面试包含 AI 评估）
+面试官会模拟真实场景：允许你 “假想使用 AI 编码助手”，考察你如何利用 AI、校验 AI 产出、修正错误，不是考你默写代码。
+三、面试流程中的实操建议（非常关键）
+开场 5 分钟
+简短英文自我介绍，聚焦你的项目、Java 技术栈，不要长篇大论。
+示例简短模板：
+I am a backend developer, mainly working with Java. I have experience building XXX services, familiar with collections, multithreading and algorithm problem‑solving.
+拿到算法题，一定要沟通，不要沉默写代码
+标准 Karat 面试正确节奏：
+1）复述题目给面试官确认：So the problem we need to solve is ... Am I understanding correctly?
+2）主动讨论边界条件：What about null input? What about empty list?
+3）讲你的解题思路，讲时间空间复杂度，面试官确认思路可行，再开始写 Java 代码。
+❌大忌：拿到题目一言不发埋头写代码，面试官看不到你的思考，直接低分。
+写 Java 代码注意点
+使用标准 JDK，不要写各种框架 Spring 相关代码，算法题不需要框架。
+方法参数判空，注意处理 null。
+代码写完，主动说：Let me walk through a test case to verify this solution，口头模拟执行。
+代码报错不要慌，用英文描述问题，现场调试，Karat 看重排错能力，不是要求一次性写出完美无 bug 代码。
+结尾候选人提问环节
+准备 2‑3 个英文问题，可以问团队技术栈、业务场景；不要问 Karat 面试官录用结果，Karat 面试官没有录用决定权。
+四、容易踩坑的扣分点（避坑清单）
+全程沉默，只敲代码，不口头讲解思路（Rubric 明确扣分）
+英文不敢开口，长期卡顿沉默，可以慢，但不能不说。
+完全忽略 edge case，不考虑 null、空输入。
+代码写完不做测试，假设代码一定正确。
+混淆 Java 集合底层原理，答不出 HashMap 等高频基础题。
+误以为 Karat 面试官拥有录取决定权，反复追问是否能过。
+依赖第三方库，在线 IDE 无法导入，导致代码跑不起来。
+五、面试前模拟训练方案
+刷题：LeetCode 中等难度，强制用 Java 写，并且口头英文口述全部思路，模拟真实面试状态。
+整理 Java 核心概念英文解释，把每个知识点练习用 2‑3 句话英文讲出来。
+使用在线面试 IDE 模拟，练习网页端写 Java，脱离本地 IDEA 快捷键。
+计时训练：一道算法题控制 20‑25 分钟内完成（读题 + 沟通 + 编码 + 测试）。
+六、面试结束
+面试结束你不会立刻知道结果；Karat 生成完整报告、录像、代码，全部交给目标公司，由目标公司决定是否进入下一轮。
+
+一、Karat 高频 Java 面试题 + 英文参考回答
+适配 Karat 英文技术面试，回答简洁，符合面试口述长度，适合背诵练习；全部为 Karat 经常问到的 Java 基础 / OOP / 集合 / JVM 考点。
+1. What is the difference between ArrayList and LinkedList?
+Answer:
+ArrayList is backed by an underlying array. It provides fast random‑access by index, but adding or removing elements in the middle is slow because elements need to be shifted.
+LinkedList is a doubly‑linked list. Random access is slow, but insertion and deletion at both ends are efficient.
+For most general‑purpose scenarios, ArrayList is preferred.
+中文参考：ArrayList 底层数组，随机访问快，中间增删慢；LinkedList 双向链表，随机访问慢，首尾增删高效；绝大多数场景优先 ArrayList。
+2. How does HashMap work in Java?
+Answer:
+HashMap stores key‑value pairs. It calculates the hash code of the key to decide the bucket index.
+When hash collision happens, multiple entries are stored in one bucket. Before Java 8 it uses a linked list. Starting from Java 8, when the threshold is reached, the linked list converts to a red‑black tree to speed‑up lookup.
+Keys must override equals() and hashCode() correctly.
+中文参考：HashMap 基于 key 的 hashCode 定位桶下标；发生哈希冲突时，Java8 前用链表，Java8 链表长度阈值超过后转为红黑树提升查询效率；key 必须正确重写 equals 和 hashCode。
+3. What is the difference between String, StringBuilder and StringBuffer?
+Answer:
+String is immutable. Every modification creates a new object.
+StringBuilder is mutable and not thread‑safe, good for single‑thread string concatenation.
+StringBuffer is mutable and thread‑safe because its methods are synchronized, so it has worse performance.
+中文参考：String 不可变，每次修改生成新对象；StringBuilder 可变、非线程安全，单线程拼接优先使用；StringBuffer 可变、加 synchronized 线程安全，性能更低。
+4. What are checked and unchecked exceptions?
+Answer:
+Checked exceptions must be declared in method signature or caught by try‑catch at compile time, for example IOException.
+Unchecked exceptions extend RuntimeException. They are validated at runtime, we do not have to catch or declare them, such as NullPointerException.
+中文参考：受检异常编译期强制捕获或声明抛出，例如 IOException；非受检异常继承 RuntimeException，运行时抛出，不必强制处理，例如空指针异常。
+5. What is the difference between heap and stack in JVM?
+Answer:
+The stack stores local variables and method call frames. Each thread has its own stack, memory is freed when method returns.
+The heap is shared by all threads, it stores all Java objects and arrays. Garbage Collection works mainly on the heap to reclaim unused memory.
+中文参考：栈属于线程私有，存放局部变量、方法栈帧，方法结束自动释放；堆线程共享，存放对象、数组，GC 主要回收堆内存。
+6. What are the four main OOP principles?
+Answer:
+Encapsulation: hide internal state and expose public methods.
+Inheritance: child class reuses and extends parent class code.
+Polymorphism: same method behaves differently for different sub‑class instances.
+Abstraction: hide implementation details via abstract classes or interfaces.
+中文参考：封装：隐藏内部状态，对外暴露方法；继承：子类复用扩展父类；多态：同一方法不同子类实例行为不同；抽象：抽象类 / 接口隐藏实现细节。
+7. What is the difference between == and equals()?
+Answer:
+== compares memory reference for objects, or raw value for primitive types.
+equals() is a method from Object class. By default it uses reference comparison, but many classes like String override equals() to compare actual content.
+中文参考：==对于基本类型比较值，对象比较内存引用；equals 是 Object 方法，默认比较引用；String 等类重写用来比较内容。
+二、模拟 Karat 算法面试题（Java）
+Karat Core 面试真实风格：中等难度，要求：沟通题目 → 分析边界 case → 讲思路 + 复杂度 → Java 编码 → 测试用例。
+题目类型：数组哈希，Karat 非常高频。
+Problem：Two Sum 变种
+Description（英文原题，面试看到就是这个）
+Given an integer array nums and an integer target, return indices of the two numbers such that they add up to target.
+You may assume each input has exactly one solution. You cannot use the same element twice.
+Return the result as an int array.
+Sample Input 1:
+nums = {2,7,11,15}, target = 9
+Sample Output: {0,1}
+Edge cases you need to consider:
+null input array
+array length less than 2
+✅面试口述思考流程（英文示范，Karat 重点看这个）
+面试时你要口头说出下面这段话，再写代码
+“So we need to find two different indices whose values sum to target. Exactly one solution exists.
+First I should handle edge cases: if array is null or length < 2, return empty array.
+Brute‑force is two nested loops with O (n²) time. We can optimize by using HashMap.
+We store number and its index in HashMap. For each element, calculate complement = target‑current value.
+If complement exists in map, return stored index and current index. Otherwise put current value and index into map.
+Time complexity is O (n), space complexity O (n).”
+Java 参考代码（Karat 在线 IDE 可直接运行）
+java
+import java.util.HashMap;
+import java.util.Map;
+
+public class TwoSumKarat {
+    public int[] twoSum(int[] nums, int target) {
+        // handle edge case
+        if(nums == null || nums.length < 2){
+            return new int[]{};
+        }
+
+        Map<Integer, Integer> map = new HashMap<>();
+        for(int i = 0; i < nums.length; i++){
+            int complement = target - nums[i];
+            if(map.containsKey(complement)){
+                return new int[]{map.get(complement), i};
+            }
+            map.put(nums[i], i);
+        }
+        // per problem statement, exactly one solution exists, this line won't hit
+        return new int[]{};
+    }
+}
+面试写完代码之后口述测试（英文示范）
+“Let me walk through sample test case. nums = [2,7,11,15], target=9.
+i=0, num=2, complement=7, map does not contain 7, put (2,0).
+i=1, num=7, complement=2, map has key 2 with index 0. Return [0,1]. Correct.”
+面试使用小提示
+英文回答不用一字不差背诵，抓住关键点即可；
+算法题 Karat 打分：沟通表达 > 思路 > 代码 > 测试用例；
+在线 IDE 只能 JDK 原生 API，不要引入 Spring 等框架类。
+
+Karat 不考冷门底层、不考八股难题、不考框架，只考「工程基础 + 常见数据结构算法 + 代码思维 + 基础计算机知识」，标准化、套路固定。
+一、必考 Java 基础（英文问答高频）
+集合体系
+ArrayList / LinkedList 区别、HashMap 底层（JDK8 优化）、HashSet 原理、集合使用场景选型
+字符串
+String / StringBuilder / StringBuffer 不可变、线程安全、性能差异
+面向对象 OOP
+四大特性、重载重写区别、抽象类 & 接口区别
+基础语法
+== 与 equals、基本类型与包装类、空指针处理
+JVM 基础
+栈与堆区别、GC 基础认知（不用深讲）
+工程能力（你重点优势）
+设计模式：模板方法、适配器、观察者（Karat 非常认可工程思维）
+二、算法 Coding（100% 必考｜难度中等）
+Karat 90% 题目集中在以下题型，无 hard 题
+数组、字符串遍历与处理（最高频）
+去重、统计、筛选、子串匹配、边界校验
+哈希表 HashMap/HashSet（Karat 招牌考点）
+两数之和、重复元素、计数、映射关系
+双指针、滑动窗口
+简单区间、子数组问题
+二分查找
+有序数组查找、边界控制
+简单贪心、排序
+区间合并、最值筛选
+Karat 算法独有特点
+题目分多小问、循序渐进
+极其看重：边写边说 + 主动讲边界 + 复杂度分析 + 自测用例
+不追求一次完美 AC，思考过程 > 代码结果
+三、计算机基础（随机英文问答）
+异常体系：受检异常 / 非受检异常
+线程基础：线程安全、简单同步概念
+基础网络：HTTP 简单概念、GET/POST 区别
+代码规范：异常处理、边界防御、可复用性
+四、Karat 新版必考：AI 协同能力（轻度）
+很多场次会带一点：
+如何使用 AI 辅助编码
+如何校验 AI 代码正确性
+AI 的优势与局限性（不用深聊，口语简单描述即可）
+五、完全不考（放心不用复习）
+不考 Spring / SpringBoot / 微服务
+不考 Redis、MQ、数据库底层
+不考高并发、JVM 调优、分布式
+不考超难算法、动态规划、树、图难题
+六、Karat 评分核心权重（最关键）
+英文沟通表达（40%）：是否全程口述思路
+代码规范与边界处理（30%）
+算法逻辑与复杂度（20%）
+工程思维 / 代码质量（10%）
+极简备考优先级
+HashMap 算法 > 数组字符串题 > Java 集合问答 > OOP > 设计模式话术
+
+
+Karat 面试要不要准备简历？（标准答案）
+结论：不需要提交、不需要展示、不看简历
+Karat 是纯标准化第三方技术测评，和普通公司面试完全不一样：
+Karat 面试官全程只考技术题
+全程流程固定：英文问答 + 算法编码 + 思路讲解。
+完全不看简历、不问项目经历、不问自我介绍细节。
+你的简历早已交给目标公司
+Karat 只负责 “考试打分”，没有你的简历资料，也无权审核你的背景。
+面试系统里没有简历上传入口
+整场面试只打开编码页面和视频窗口，无简历展示环节。
+但是！有一个「隐性准备」
+虽然面试不用简历，但你需要：
+熟悉你简历上写的 Java / 设计模式 / 技术栈
+极少数情况面试官随口一问：
+What technologies are you familiar with?
+你要用你简历写过的内容回答，不要说出简历没有的技术。
+最简总结
+❌ 不用带简历、不用展示、不用上传
+✅ 只需要熟练我刚刚给你的英文脚本 + Java 知识点
+
